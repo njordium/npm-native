@@ -20,7 +20,7 @@ Most Nginx Proxy Manager installation guides assume Docker. The official project
 ## Quick start
 
 ```bash
-wget -O npm-installer.sh https://raw.githubusercontent.com/team-njordium/npm-native/main/npm-installer.sh
+wget -O npm-installer.sh https://github.com/njordium/npm-native/blob/main/npm-installer.sh
 chmod +x npm-installer.sh
 sudo bash npm-installer.sh
 ```
