@@ -625,6 +625,24 @@ for dir in "proxy_host" "letsencrypt" "logs" "ssl-certs"; do
         fail "Data directory '${dir}' missing"
     fi
 done
+# v1.0.3: default_host and default_www are required for Settings > Default Site.
+# Missing default_host → generateConfig("default") throws → empty 200 → JSON.parse fails.
+# Missing default_www  → fs.writeFileSync(html) throws synchronously → Node crash → 502.
+if grep -q 'default_host' "${SCRIPT}"; then
+    ok "default_host directory created (Settings > Default Site writes site.conf here)"
+else
+    fail "default_host missing — all Default Site options return empty body (JSON.parse error)"
+fi
+if grep -q 'default_www' "${SCRIPT}"; then
+    ok "default_www directory created (Custom HTML option writes index.html here)"
+else
+    fail "default_www missing — Custom HTML option crashes Node.js (502 Bad Gateway)"
+fi
+if grep -q 'ExecStartPre.*default_host\|ExecStartPre.*default_www' "${SCRIPT}"; then
+    ok "default_host/default_www in ExecStartPre — recreated on every service start/reboot"
+else
+    fail "default_host/default_www not in ExecStartPre — missing after reboot causes same crash"
+fi
 
 # ── T11: Locale lang directory simulation ────────────────────────────────────
 section "T11 Locale lang files (git clone simulation)"
