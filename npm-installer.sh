@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.0.2 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.0.3 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 # =============================================================================
@@ -12,7 +12,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.0.2"           # installer script version
+SCRIPT_VERSION="1.0.3"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -1197,6 +1197,12 @@ mkdir -p /tmp/nginx/body
 mkdir -p /data/logs
 mkdir -p /data/letsencrypt-acme-challenge/.well-known/acme-challenge
 mkdir -p /tmp/letsencrypt-lib
+# Default site directories — REQUIRED for Settings > Default Site to work:
+# /data/nginx/default_host/ → generateConfig('default') writes here
+# /data/nginx/default_www/  → Custom HTML saves index.html here
+# Missing either directory causes: empty 200 responses or Node.js crash (502)
+mkdir -p /data/nginx/default_host
+mkdir -p /data/nginx/default_www
 mkdir -p /var/lib/nginx/cache/public
 mkdir -p /var/lib/nginx/cache/private
 
@@ -1489,7 +1495,7 @@ Environment=NGINX_BINARY=/usr/sbin/nginx
 # Ensure required runtime directories exist before starting
 # /tmp/letsencrypt-lib  → certbot --work-dir (REQUIRED: certbot will not create it)
 # /data/letsencrypt-acme-challenge → certbot webroot for HTTP-01 ACME challenge
-ExecStartPre=-/bin/mkdir -p /tmp/nginx/body /tmp/letsencrypt-lib /data/letsencrypt-acme-challenge/.well-known/acme-challenge
+ExecStartPre=-/bin/mkdir -p /tmp/nginx/body /tmp/letsencrypt-lib /data/letsencrypt-acme-challenge/.well-known/acme-challenge /data/nginx/default_host /data/nginx/default_www
 # Ensure nginx is running when we start — on reboot nginx may start slightly later
 ExecStartPre=-/bin/systemctl start nginx
 ExecStart=/usr/bin/node index.js --abort_on_uncaught_exception --max_old_space_size=250
