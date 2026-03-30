@@ -203,8 +203,4 @@ Please test against both Debian and Ubuntu before submitting.
 
 ---
 
-## Authors
-
-**Kim Haverblad** and **Tommy Jansson** — [Team Njordium](https://njordium.com)
-
 *Giving back to the open source community that makes our work possible.*
