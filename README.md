@@ -1,5 +1,7 @@
 **A native Bash installer for [Nginx Proxy Manager](https://nginxproxymanager.com/) on Debian and Ubuntu — no Docker required.**
 
+<img width="592" height="407" alt="native-npm-installer" src="https://github.com/user-attachments/assets/9ca9cb59-a534-44c4-b9b0-2548f605430b" />
+
 ## Why this exists
 
 Most Nginx Proxy Manager installation guides assume Docker. The official project ships as a Docker image, and the popular [Proxmox Community Scripts](https://community-scripts.github.io/ProxmoxVE/) LXC installer still pulls a Docker image inside the container. If you want NPM running natively on bare Debian or Ubuntu — managed by systemd, backed by SQLite, with no container layer — there was no clean, maintained path to get there. This script fills that gap.
