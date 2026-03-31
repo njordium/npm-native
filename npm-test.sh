@@ -1,8 +1,40 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  End-to-End Test Suite — Nginx Proxy Manager Native Installer
-#  Tests the installer logic, structure, and key transformations in isolation
-#  WITHOUT requiring a live Debian system or network (offline static analysis).
+#  npm-test.sh — Developer & CI Validation Tool
+#  Nginx Proxy Manager Native Installer v1.1.0
+#
+#  PURPOSE
+#  -------
+#  This script is a developer and CI tool for validating changes to
+#  npm-installer.sh BEFORE they reach end users. It is NOT intended as a
+#  post-install health check for end users.
+#
+#  If you have just installed NPM and want to verify your installation is
+#  working correctly, use the built-in verify mode instead:
+#
+#      sudo bash npm-installer.sh --verify
+#
+#  HOW IT WORKS
+#  ------------
+#  Two sections run in sequence:
+#
+#  1. STATIC ANALYSIS (always runs, no system required)
+#     Offline grep-based checks against the installer script text.
+#     Verifies structure, logic, config correctness, and known bug patterns.
+#     Safe to run in CI, on any machine, without NPM installed.
+#
+#  2. LIVE SYSTEM CHECKS (auto-detected, skips if NPM not installed)
+#     Verifies actual filesystem state of a running installation:
+#     /opt/certbot venv, required data directories, service enable status,
+#     nginx config validity. Automatically skipped when NPM is not installed.
+#
+#  USAGE
+#  -----
+#  Place npm-test.sh in the same directory as npm-installer.sh, then run:
+#
+#      bash npm-test.sh
+#
+#  Authors: Kim Haverblad & Tommy Jansson — Team Njordium
 # =============================================================================
 set -euo pipefail
 
@@ -404,7 +436,35 @@ fi
 
 # ── T08 nginx config — self-contained, no docker/rootfs conf.d ───────────────
 # ── T07b Systemd service: certbot prerequisites ───────────────────────────────
-section "T07b Systemd service: certbot runtime directories and PATH"
+# ── T07b Certbot virtualenv (DNS challenge support) ───────────────────────────
+section "T07b Certbot: /opt/certbot virtualenv for DNS challenge plugins"
+# NPM's lib/certbot.js always runs:
+#   . /opt/certbot/bin/activate && pip install <plugin> && deactivate
+# Without the venv, ALL DNS challenge cert requests fail.
+# The venv certbot must also be first in PATH so certbot can find
+# the installed plugins when running DNS challenges.
+if grep -q 'python3 -m venv /opt/certbot' "${SCRIPT}"; then
+    ok "/opt/certbot venv created at install time (DNS plugin installs will work)"
+else
+    fail "/opt/certbot venv not created — DNS challenge cert requests will fail"
+fi
+if grep -q '/opt/certbot/bin/pip install.*certbot' "${SCRIPT}"; then
+    ok "certbot installed into venv (DNS plugins can co-exist with certbot)"
+else
+    fail "certbot not installed into venv — plugin installs may conflict"
+fi
+if grep -q 'PATH=/opt/certbot/bin:' "${SCRIPT}"; then
+    ok "/opt/certbot/bin first in systemd PATH — certbot finds venv plugins"
+else
+    fail "/opt/certbot/bin not first in PATH — certbot uses system Python, misses plugins"
+fi
+if grep -q 'opt/certbot.*bin/activate' "${SCRIPT}"; then
+    ok "Verify mode checks /opt/certbot/bin/activate exists"
+else
+    fail "Verify mode missing certbot venv check"
+fi
+
+section "T07c Systemd service: runtime directories and PATH"
 # certbot needs /tmp/letsencrypt-lib (--work-dir) and
 # /data/letsencrypt-acme-challenge (webroot for HTTP-01 challenge).
 # Neither is auto-created by certbot — must exist before service starts.
@@ -618,7 +678,10 @@ else
 fi
 
 section "T10 Data directory setup"
-for dir in "proxy_host" "letsencrypt" "logs" "ssl-certs"; do
+# /data/letsencrypt and /data/ssl-certs intentionally not created by the installer:
+# letsencrypt → certbot uses /etc/letsencrypt/ directly in native installs
+# ssl-certs   → unreferenced in NPM v2.14.0; would be an empty unused directory
+for dir in "proxy_host" "logs"; do
     if grep -q "${dir}" "${SCRIPT}"; then
         ok "Data directory '${dir}' referenced"
     else
@@ -947,6 +1010,73 @@ if [[ $? -eq 0 ]]; then
 else
     fail "ALLOWED_BUILDS JSON invalid or incomplete"
 fi
+# =============================================================================
+# LIVE SYSTEM CHECKS — only run when NPM is installed on this machine
+# These catch runtime issues that static analysis cannot: missing directories,
+# venv not created, services not enabled, etc.
+# =============================================================================
+if [[ -f "/opt/nginx-proxy-manager/backend/package.json" ]]; then
+    echo ""
+    echo -e "${BOLD}── Live System Checks (NPM installation detected) ──${NC}"
+
+    # /opt/certbot virtualenv — critical for DNS challenge certificates
+    if [[ -f "/opt/certbot/bin/activate" ]]; then
+        ok "LIVE: /opt/certbot/bin/activate exists"
+    else
+        fail "LIVE: /opt/certbot virtualenv MISSING — DNS challenge cert requests will fail"
+    fi
+    if [[ -x "/opt/certbot/bin/certbot" ]]; then
+        _CB_VER=$(/opt/certbot/bin/certbot --version 2>&1 | grep -oP '[\d.]+' | head -1)
+        ok "LIVE: /opt/certbot/bin/certbot executable (v${_CB_VER})"
+    else
+        fail "LIVE: /opt/certbot/bin/certbot not executable"
+    fi
+    if [[ -x "/opt/certbot/bin/pip" ]]; then
+        ok "LIVE: /opt/certbot/bin/pip executable"
+    else
+        fail "LIVE: /opt/certbot/bin/pip not executable — plugin installs will fail"
+    fi
+
+    # Validate installPlugin() shell command works (no actual plugin — just activate/deactivate)
+    if bash -c ". /opt/certbot/bin/activate && deactivate" 2>/dev/null; then
+        ok "LIVE: /opt/certbot/bin/activate sources and deactivates cleanly"
+    else
+        fail "LIVE: /opt/certbot venv activate script broken"
+    fi
+
+    # Required data directories
+    for _live_dir in         "/data/nginx/default_host"         "/data/nginx/default_www"         "/data/letsencrypt-acme-challenge/.well-known/acme-challenge"         "/tmp/letsencrypt-lib"; do
+        if [[ -d "${_live_dir}" ]]; then
+            ok "LIVE: directory exists: ${_live_dir}"
+        else
+            fail "LIVE: directory MISSING: ${_live_dir}"
+        fi
+    done
+
+    # Services enabled for autostart
+    if systemctl is-enabled --quiet nginx-proxy-manager 2>/dev/null; then
+        ok "LIVE: nginx-proxy-manager enabled (auto-starts on reboot)"
+    else
+        fail "LIVE: nginx-proxy-manager NOT enabled — won't start after reboot"
+    fi
+    if systemctl is-enabled --quiet nginx 2>/dev/null; then
+        ok "LIVE: nginx enabled (auto-starts on reboot)"
+    else
+        fail "LIVE: nginx NOT enabled — won't start after reboot"
+    fi
+
+    # nginx -t
+    if nginx -t &>/dev/null 2>&1; then
+        ok "LIVE: nginx -t syntax OK"
+    else
+        fail "LIVE: nginx -t FAILED — proxy host config creation will silently roll back"
+    fi
+else
+    echo ""
+    echo "── Live System Checks (skipped — NPM not installed on this machine) ──"
+    (( SKIP += 11 )) || true
+fi
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 TOTAL=$((PASS + FAIL + SKIP))
