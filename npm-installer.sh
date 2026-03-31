@@ -259,6 +259,12 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     else
         _pfail "nginx                NOT running"
     fi
+    if systemctl is-enabled --quiet nginx 2>/dev/null; then
+        _pok  "nginx                enabled (auto-starts on reboot)"
+    else
+        _pwarn "nginx                NOT enabled — won't start after reboot"
+        echo  "       → run: systemctl enable nginx"
+    fi
     if nginx -t &>/dev/null 2>&1; then
         _pok  "nginx config         syntax OK"
     else
