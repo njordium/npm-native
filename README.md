@@ -153,15 +153,12 @@ sudo rm -rf /opt/nginx-proxy-manager
 
 ---
 
-## Companion test suite
-
-A companion test suite (`npm-test.sh`) ships alongside the installer. It performs static analysis of the install script — syntax checks, structural validation, and logic verification — without requiring a live system.
-
+## Verifying your installation
+After installing, use the built-in verify mode to confirm everything is working:
 ```bash
-bash npm-test.sh
+sudo bash npm-installer.sh --verify
 ```
-
-Currently covers 125 assertions across installation logic, nginx config, systemd unit, Node.js install hardening, certbot prerequisites, OS compatibility, and more.
+This produces a full health-check dashboard covering services, network, API, SSL, configuration, and more — no separate tool needed.
 
 ---
 
