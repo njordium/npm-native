@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.0.3 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.0 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 # =============================================================================
@@ -12,7 +12,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.0.3"           # installer script version
+SCRIPT_VERSION="1.1.0"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -380,6 +380,15 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     fi
     grep -q 'proxy_pass.*127.0.0.1:3000' /etc/nginx/nginx.conf 2>/dev/null         && _pok  "nginx proxy          port ${ADMIN_PORT} → :3000 present"         || _pfail "nginx proxy          port ${ADMIN_PORT} → :3000 missing in nginx.conf"
 
+    # Certbot virtualenv — required for DNS challenge certificate requests
+    if [[ -f "/opt/certbot/bin/activate" ]]; then
+        _CB_VER=$(/opt/certbot/bin/certbot --version 2>&1 | grep -oP '[\d.]+' | head -1)
+        _pok  "certbot venv         /opt/certbot (v${_CB_VER}) — DNS plugins will install correctly"
+    else
+        _pfail "certbot venv         /opt/certbot MISSING — DNS challenge cert requests will fail"
+        echo  "       → run: python3 -m venv /opt/certbot && /opt/certbot/bin/pip install certbot"
+    fi
+
     # Check Docker rootfs include files — required for proxy host config generation
     _MISS=0
     for _INC in proxy.conf block-exploits.conf force-ssl.conf ssl-ciphers.conf; do
@@ -488,6 +497,22 @@ vrun apt-get install -y --no-install-recommends \
     python3-certbot-nginx
 
 log "System packages installed."
+
+# ---------------------------------------------------------------------------
+# Create /opt/certbot Python virtualenv
+# ---------------------------------------------------------------------------
+# NPM's DNS plugin installer (lib/certbot.js) always runs:
+#   . /opt/certbot/bin/activate && pip install <plugin> && deactivate
+# This virtualenv MUST exist or all DNS challenge cert requests fail with
+# "No such file or directory: /opt/certbot/bin/activate".
+# The venv certbot is also added FIRST in PATH in the systemd unit so that
+# when certbot runs DNS challenges it uses /opt/certbot/bin/certbot, which
+# can find the DNS plugins installed into the same venv.
+step "Creating certbot virtualenv at /opt/certbot"
+python3 -m venv /opt/certbot
+vrun /opt/certbot/bin/pip install --quiet --upgrade pip
+vrun /opt/certbot/bin/pip install --quiet certbot
+log "certbot virtualenv ready: $(/opt/certbot/bin/certbot --version 2>&1)" 
 
 # ---------------------------------------------------------------------------
 # Step 2 — Node.js (via NodeSource)
@@ -1121,9 +1146,9 @@ mkdir -p \
     "${NPM_DATA}/nginx/access" \
     "${NPM_DATA}/nginx/custom" \
     "${NPM_DATA}/nginx/temp" \
-    "${NPM_DATA}/logs" \
-    "${NPM_DATA}/letsencrypt" \
-    "${NPM_DATA}/ssl-certs"
+    "${NPM_DATA}/logs"
+# /data/letsencrypt omitted: certbot writes to /etc/letsencrypt/ directly in native installs.
+# /data/ssl-certs   omitted: unreferenced in NPM v2.14.0; custom certs live in /data/custom_ssl/
 
 # Touch required custom-snippet stubs so nginx includes don't fail on first start
 for STUB in \
@@ -1486,7 +1511,7 @@ Type=simple
 WorkingDirectory=${NPM_HOME}/backend
 # Explicit PATH ensures certbot/nginx are found regardless of how systemd
 # initialises the environment (certbot lives at /usr/bin/certbot)
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=/opt/certbot/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=NODE_ENV=production
 Environment=SUPPRESS_NO_CONFIG_WARNING=1
 Environment=LD_PRELOAD=
