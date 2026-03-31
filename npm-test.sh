@@ -713,6 +713,13 @@ if grep -q '/data/access' "${SCRIPT}"; then
 else
     fail "/data/access missing — every access list save returns 500 Internal Error"
 fi
+# /data/custom_ssl/ must exist before writeCustomCert() is called;
+# mkdirSync(npm-<id>) has no {recursive:true} so parent MUST pre-exist
+if grep -q '/data/custom_ssl' "${SCRIPT}"; then
+    ok "/data/custom_ssl created — custom SSL cert upload parent dir present"
+else
+    fail "/data/custom_ssl missing — custom SSL cert upload crashes (mkdirSync no recursive)"
+fi
 if grep -q 'ExecStartPre.*data/access' "${SCRIPT}"; then
     ok "/data/access in ExecStartPre — recreated on every service start/reboot"
 else
@@ -1053,7 +1060,7 @@ if [[ -f "/opt/nginx-proxy-manager/backend/package.json" ]]; then
     fi
 
     # Required data directories
-    for _live_dir in         "/data/nginx/default_host"         "/data/nginx/default_www"         "/data/letsencrypt-acme-challenge/.well-known/acme-challenge"         "/data/access"         "/tmp/letsencrypt-lib"; do
+    for _live_dir in         "/data/nginx/default_host"         "/data/nginx/default_www"         "/data/letsencrypt-acme-challenge/.well-known/acme-challenge"         "/data/access"         "/data/custom_ssl"         "/tmp/letsencrypt-lib"; do
         if [[ -d "${_live_dir}" ]]; then
             ok "LIVE: directory exists: ${_live_dir}"
         else
@@ -1082,7 +1089,7 @@ if [[ -f "/opt/nginx-proxy-manager/backend/package.json" ]]; then
 else
     echo ""
     echo "── Live System Checks (skipped — NPM not installed on this machine) ──"
-    (( SKIP += 12 )) || true
+    (( SKIP += 13 )) || true
 fi
 
 echo ""
