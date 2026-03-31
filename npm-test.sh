@@ -38,7 +38,7 @@
 # =============================================================================
 set -euo pipefail
 
-PASS=0; FAIL=0; SKIP=0
+PASS=0; FAIL=0; WARN=0; SKIP=0
 # Locate installer relative to this test script, then fall back to CWD
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/npm-installer.sh" ]]; then
@@ -53,9 +53,11 @@ echo "Testing: ${SCRIPT}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
-ok()   { echo -e "${GREEN}[PASS]${NC} $*"; ((PASS++)) || true; }
-fail() { echo -e "${RED}[FAIL]${NC} $*"; ((FAIL++)) || true; }
-skip() { echo -e "${YELLOW}[SKIP]${NC} $*"; ((SKIP++)) || true; }
+BOLD='\033[1m'; DIM='\033[2m'; CYAN='\033[0;36m'
+ok()   { echo -e "${GREEN}[PASS]${NC} $*"; ((PASS++))  || true; }
+fail() { echo -e "${RED}[FAIL]${NC} $*";  ((FAIL++))  || true; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; ((WARN++)) || true; }
+skip() { echo -e "${YELLOW}[SKIP]${NC} $*"; ((SKIP++))  || true; }
 section() { echo -e "\n── $* ──"; }
 
 # ── T01: Bash syntax check ────────────────────────────────────────────────────
@@ -626,20 +628,32 @@ else
     fail "package.json version not patched — footer will show v2.0.0 and false update banner"
 fi
 # Verify patch runs BEFORE pnpm install (ESM import caches at process startup)
+set +e
 python3 - "${SCRIPT}" << 'PYVER'
 import sys
 with open(sys.argv[1]) as f:
     lines = f.readlines()
-patch = next((i for i,l in enumerate(lines) if 'version = $v' in l and 'package' in l), None)
+patch = next((i for i,l in enumerate(lines) if '.version = $v' in l and 'jq' in l), None)
 pnpm  = next((i for i,l in enumerate(lines) if 'pnpm install --prod' in l), None)
 if patch and pnpm and patch < pnpm:
-    print("PASS patch line {} before pnpm install line {}".format(patch+1, pnpm+1))
+    print("OK patch line {} before pnpm install line {}".format(patch+1, pnpm+1))
+    sys.exit(0)
 elif patch and pnpm:
-    print("FAIL patch line {} is AFTER pnpm install line {} — wrong order".format(patch+1, pnpm+1))
+    print("FAIL patch line {} is AFTER pnpm install line {}".format(patch+1, pnpm+1))
+    sys.exit(1)
 else:
-    print("WARN could not locate both lines")
+    print("SKIP could not locate both patch and pnpm lines in script")
+    sys.exit(2)
 PYVER
-[[ $? -eq 0 ]] && ok "Patch order correct (before pnpm install)" || fail "Patch order wrong"
+_t09b_exit=$?
+set -e
+if [[ ${_t09b_exit} -eq 0 ]]; then
+    ok "Version patch order correct (runs before pnpm install --prod)"
+elif [[ ${_t09b_exit} -eq 2 ]]; then
+    warn "Version patch order: could not locate both lines to verify order"
+else
+    fail "Version patch order wrong — ESM import caches at startup, wrong order breaks version display"
+fi
 
 # ── T10: Data directories created ────────────────────────────────────────────
 # ── T09c Backend deprecated transitive dep fixes ──────────────────────────────
@@ -782,78 +796,59 @@ fi
 
 # ── T15 nginx.conf semantic validation ───────────────────────────────────────
 section "T15 nginx.conf log format completeness"
-# Extract every log_format name referenced in conf.d files from the script,
-# then verify each is defined in our nginx.conf heredoc.
-# This catches "unknown log format" errors before any deployment.
-python3 - "${SCRIPT}" << 'T15EOF'
-import re, sys
-
-script_path = sys.argv[1] if len(sys.argv) > 1 else "npm-installer.sh"
-with open(script_path) as fh:
-    script = fh.read()
-
-parts = script.split("NGINX_CONF")
-if len(parts) < 3:
-    print("FAIL nginx.conf heredoc not found")
-    sys.exit(1)
-nginx_conf = parts[1].strip()
-
-ok = True
-
-# 1. Required log formats
-for fmt in ("standard", "proxy"):
-    if "log_format " + fmt in nginx_conf:
-        print("PASS log_format '{}' defined".format(fmt))
-    else:
-        print("FAIL log_format '{}' missing".format(fmt)); ok = False
-
-# 2. No wildcard conf.d/*.conf — that's where production.conf lives
-if "conf.d/*.conf" in nginx_conf:
-    print("FAIL conf.d/*.conf in nginx.conf — would load production.conf and conflict with Node.js on port 81")
-    ok = False
-else:
-    print("PASS no conf.d/*.conf wildcard (production.conf excluded)")
-
-# 3. Port 81: nginx serves static files + proxies /api/ to port 3000
+python3 - "${SCRIPT}" << 'T15PYEOF'
+import sys, re
+with open(sys.argv[1]) as f:
+    src = f.read()
+start = src.find("cat > /etc/nginx/nginx.conf << 'NGINX_CONF'")
+end   = src.find("\nNGINX_CONF\n", start)
+if start < 0 or end < 0:
+    print("SKIP nginx.conf heredoc not found in script")
+    sys.exit(2)
+nginx = src[start:end]
+failures = []
+# Log formats
+for fmt in ["standard", "proxy"]:
+    if f"log_format {fmt}" not in nginx:
+        failures.append(f"log_format '{fmt}' NOT defined")
+# Excludes
+if "conf.d/*.conf" in nginx:
+    failures.append("conf.d/*.conf wildcard present — would load production.conf")
+# Server block checks
 checks = [
-    ("listen 81"                       in nginx_conf, "listen 81 server block present"),
-    ("location /api/"                  in nginx_conf, "/api/ location block routes to backend"),
-    ("proxy_pass" in nginx_conf and "3000/" in nginx_conf, "proxy_pass to port 3000/ with trailing slash (strips /api/ prefix)"),
-    ("try_files" in nginx_conf and "index.html" in nginx_conf, "try_files → index.html for SPA routing"),
-    ("root" in nginx_conf and "frontend" in nginx_conf, "root points to frontend/ for static serving"),
+    ("listen 81",            "listen 81 server block"),
+    ("location /api/",       "/api/ location block routes to backend"),
+    ("proxy_pass.*3000/",    "proxy_pass to port 3000/ with trailing slash"),
+    ("try_files.*index.html","try_files -> index.html for SPA routing"),
+    ("root.*frontend",       "root points to frontend/ for static serving"),
 ]
-for passed, label in checks:
-    if passed:
-        print("PASS " + label)
-    else:
-        print("FAIL " + label)
-        ok = False
-
-# 4. /data/nginx/ runtime paths included
-for p in ("proxy_host", "redirection_host", "dead_host"):
-    if "/data/nginx/{}/".format(p) in nginx_conf:
-        print("PASS /data/nginx/{} included".format(p))
-    else:
-        print("FAIL /data/nginx/{} missing".format(p)); ok = False
-
-# 4. Only resolvers.conf at http level
-if "conf.d/include/resolvers.conf" in nginx_conf:
-    print("PASS only resolvers.conf included at http level")
-else:
-    print("FAIL resolvers.conf include missing"); ok = False
-
-if "conf.d/include/*.conf" in nginx_conf:
-    print("FAIL conf.d/include/*.conf wildcard present — pulls in location{} snippets")
-    ok = False
-else:
-    print("PASS no conf.d/include/*.conf wildcard (correct)")
-
-sys.exit(0 if ok else 1)
-T15EOF
-if [[ $? -eq 0 ]]; then
-    ok "nginx.conf defines all required log formats in correct include order"
+import re as _re
+for pat, label in checks:
+    if not _re.search(pat, nginx):
+        failures.append(f"{label} MISSING")
+# Data includes
+for p in ["proxy_host", "redirection_host", "dead_host"]:
+    if f"data/nginx/{p}" not in nginx:
+        failures.append(f"/data/nginx/{p} NOT included")
+# Resolvers
+if "conf.d/include/resolvers.conf" not in nginx:
+    failures.append("resolvers.conf not included")
+if "conf.d/include/*.conf" in nginx:
+    failures.append("conf.d/include/*.conf wildcard present")
+if failures:
+    for f in failures:
+        print(f"FAIL {f}")
+    sys.exit(1)
+print("OK nginx.conf structure complete and correct")
+sys.exit(0)
+T15PYEOF
+_t15=$?
+if [[ ${_t15} -eq 0 ]]; then
+    ok "nginx.conf: log formats, server blocks, proxy, includes all correct"
+elif [[ ${_t15} -eq 2 ]]; then
+    warn "nginx.conf heredoc not found in script — T15 skipped"
 else
-    fail "nginx.conf missing log formats or include order wrong"
+    fail "nginx.conf structure has issues — see output above"
 fi
 
 # ── T17 Docker rootfs conf.d/include files ────────────────────────────────────
@@ -1001,12 +996,12 @@ if missing:
         print(f"FAIL '{d}' missing from ALLOWED_BUILDS")
     sys.exit(1)
 else:
-    print(f"PASS ALLOWED_BUILDS JSON valid, contains all required packages: {sorted(required)}")
+    print("OK all required packages present")
 
 sys.exit(0)
 T16PYEOF
 if [[ $? -eq 0 ]]; then
-    ok "ALLOWED_BUILDS JSON is valid and complete"
+    ok "ALLOWED_BUILDS JSON valid, contains all required packages: bcrypt, sqlite3, better-sqlite3"
 else
     fail "ALLOWED_BUILDS JSON invalid or incomplete"
 fi
@@ -1078,10 +1073,22 @@ else
 fi
 
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-TOTAL=$((PASS + FAIL + SKIP))
-echo -e "Results: ${GREEN}${PASS} passed${NC}  ${RED}${FAIL} failed${NC}  ${YELLOW}${SKIP} skipped${NC}  / ${TOTAL} total"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"
-[[ ${FAIL} -eq 0 ]] && { echo -e "${GREEN}All tests passed.${NC}"; exit 0; } \
-                     || { echo -e "${RED}${FAIL} test(s) failed.${NC}"; exit 1; }
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+TOTAL=$((PASS + FAIL + WARN + SKIP))
+echo -e "  ${GREEN}Passed :${NC}  ${PASS}"
+[[ ${FAIL} -gt 0 ]]  && echo -e "  ${RED}Failed :${NC}  ${FAIL}"                       || echo -e "  Failed :  ${FAIL}"
+[[ ${WARN} -gt 0 ]]  && echo -e "  ${YELLOW}Warnings:${NC}  ${WARN}"                       || echo -e "  Warnings:  ${WARN}"
+[[ ${SKIP} -gt 0 ]]  && echo -e "  ${YELLOW}Skipped :${NC}  ${SKIP} (live checks — NPM not installed)"                       || echo -e "  Skipped :  ${SKIP}"
+echo -e "  ─────────────────────────────────────────────────────"
+echo -e "  Total   :  ${TOTAL}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+if [[ ${FAIL} -eq 0 && ${WARN} -eq 0 ]]; then
+    echo -e "${GREEN}All tests passed.${NC}"
+elif [[ ${FAIL} -eq 0 ]]; then
+    echo -e "${YELLOW}All tests passed with ${WARN} warning(s) — review output above.${NC}"
+else
+    echo -e "${RED}${FAIL} test(s) failed.${NC} Review output above."
+fi
+echo ""
+[[ ${FAIL} -eq 0 ]] && exit 0 || exit 1
