@@ -705,6 +705,19 @@ done
 # v1.0.3: default_host and default_www are required for Settings > Default Site.
 # Missing default_host → generateConfig("default") throws → empty 200 → JSON.parse fails.
 # Missing default_www  → fs.writeFileSync(html) throws synchronously → Node crash → 502.
+# /data/access/ — htpasswd files written by build() for every access list save.
+# Missing directory → fs.writeFileSync throws → 500 Internal Error on every
+# access list create/update, even though the DB row saves correctly.
+if grep -q '/data/access' "${SCRIPT}"; then
+    ok "/data/access created — access list htpasswd files write correctly"
+else
+    fail "/data/access missing — every access list save returns 500 Internal Error"
+fi
+if grep -q 'ExecStartPre.*data/access' "${SCRIPT}"; then
+    ok "/data/access in ExecStartPre — recreated on every service start/reboot"
+else
+    fail "/data/access not in ExecStartPre — missing after reboot causes same crash"
+fi
 if grep -q 'default_host' "${SCRIPT}"; then
     ok "default_host directory created (Settings > Default Site writes site.conf here)"
 else
@@ -1040,7 +1053,7 @@ if [[ -f "/opt/nginx-proxy-manager/backend/package.json" ]]; then
     fi
 
     # Required data directories
-    for _live_dir in         "/data/nginx/default_host"         "/data/nginx/default_www"         "/data/letsencrypt-acme-challenge/.well-known/acme-challenge"         "/tmp/letsencrypt-lib"; do
+    for _live_dir in         "/data/nginx/default_host"         "/data/nginx/default_www"         "/data/letsencrypt-acme-challenge/.well-known/acme-challenge"         "/data/access"         "/tmp/letsencrypt-lib"; do
         if [[ -d "${_live_dir}" ]]; then
             ok "LIVE: directory exists: ${_live_dir}"
         else
@@ -1069,7 +1082,7 @@ if [[ -f "/opt/nginx-proxy-manager/backend/package.json" ]]; then
 else
     echo ""
     echo "── Live System Checks (skipped — NPM not installed on this machine) ──"
-    (( SKIP += 11 )) || true
+    (( SKIP += 12 )) || true
 fi
 
 echo ""
