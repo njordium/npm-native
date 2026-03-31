@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.0 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.1 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 # =============================================================================
@@ -12,7 +12,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.0"           # installer script version
+SCRIPT_VERSION="1.1.1"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -1234,6 +1234,9 @@ mkdir -p /tmp/letsencrypt-lib
 # Missing either directory causes: empty 200 responses or Node.js crash (502)
 mkdir -p /data/nginx/default_host
 mkdir -p /data/nginx/default_www
+# /data/access/ — htpasswd files written by access-list build();
+# missing directory causes 500 Internal Error on every access list save
+mkdir -p /data/access
 mkdir -p /var/lib/nginx/cache/public
 mkdir -p /var/lib/nginx/cache/private
 
@@ -1526,7 +1529,7 @@ Environment=NGINX_BINARY=/usr/sbin/nginx
 # Ensure required runtime directories exist before starting
 # /tmp/letsencrypt-lib  → certbot --work-dir (REQUIRED: certbot will not create it)
 # /data/letsencrypt-acme-challenge → certbot webroot for HTTP-01 ACME challenge
-ExecStartPre=-/bin/mkdir -p /tmp/nginx/body /tmp/letsencrypt-lib /data/letsencrypt-acme-challenge/.well-known/acme-challenge /data/nginx/default_host /data/nginx/default_www
+ExecStartPre=-/bin/mkdir -p /tmp/nginx/body /tmp/letsencrypt-lib /data/letsencrypt-acme-challenge/.well-known/acme-challenge /data/nginx/default_host /data/nginx/default_www /data/access
 # Ensure nginx is running when we start — on reboot nginx may start slightly later
 ExecStartPre=-/bin/systemctl start nginx
 ExecStart=/usr/bin/node index.js --abort_on_uncaught_exception --max_old_space_size=250
