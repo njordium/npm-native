@@ -1,4 +1,6 @@
-**A native Bash installer for [Nginx Proxy Manager](https://nginxproxymanager.com/) on Debian and Ubuntu — no Docker required.** <img width="945" height="767" alt="native-npm-installer" src="https://github.com/user-attachments/assets/a9a28be8-9a37-464f-a889-b8c137efca33" />
+**A native Bash installer for [Nginx Proxy Manager](https://nginxproxymanager.com/) on Debian and Ubuntu — no Docker required.**
+
+<img width="945" height="767" alt="native-npm-installer" src="https://github.com/user-attachments/assets/a9a28be8-9a37-464f-a889-b8c137efca33" />
 
 ## Why this exists
 
@@ -138,6 +140,19 @@ The NPM source tree requires several patches to build outside of the Docker CI e
 
 ---
 
+## Backup & recovery
+
+`npm-backup.sh` is a lightweight companion script for backing up and restoring a native NPM installation.
+
+```bash
+sudo bash npm-backup.sh --backup              # archive saved next to the script
+sudo bash npm-backup.sh --recover <archive>   # restore from archive
+```
+
+What gets backed up: `/data/` (proxy hosts, database, keys), `/etc/letsencrypt/` (SSL certificates), and optionally the certbot virtualenv at `/opt/certbot/` (required if you use DNS challenge certificates). Archives are fully compatible with `npm-backrecov.sh` for more advanced backup scenarios including Docker and PVE LXC support.
+
+---
+
 ## Updating NPM
 
 To update to the latest NPM release while preserving your configuration and all proxy hosts:
@@ -173,37 +188,6 @@ sudo bash npm-installer.sh --verify
 ```
 
 This produces a full health-check dashboard covering services, network, API, SSL, configuration, and more — no separate tool needed.
-
----
-
-## Changelog
-
-### v1.1.4 — 2026-04-01
-- **Fix:** Vite build hanging mid-transform on re-run machines — pnpm's global store retains corrupt entries from prior aborted installs, causing vite to deadlock reading incomplete module files
-
-### v1.1.3 — 2026-04-01
-- **Fix:** `tsconfig.json` JSONC patch failing to parse — NPM's tsconfig uses trailing commas which `json.loads()` rejects, causing the patch to silently skip and the build to still fail on test files
-
-### v1.1.2 — 2026-03-31
-- **Fix:** TypeScript build errors `TS2304`/`TS2580` — `tsc` compiled `Utils.test.tsx` which references Node.js globals not typed in the browser tsconfig
-
-### v1.1.1 — 2026-03-31
-- **Fix:** Access list save returning HTTP 500 — `/data/access/` directory not created at install time
-
-### v1.1.0 — 2026-03-31
-- **Fix:** DNS challenge certificates failing — `/opt/certbot` virtualenv not created at install time
-
-### v1.0.3 — 2026-03-30
-- **Fix:** Custom SSL certificate upload crashing — `/data/custom_ssl/` directory not created at install time
-
-### v1.0.2 — 2026-03-29
-- **Fix:** Services not starting correctly after install — nginx restart and service enable sequencing
-
-### v1.0.1 — 2026-03-29
-- **Fix:** Services not auto-starting after reboot — `systemctl enable` silently failed when wrapped in the output suppressor
-
-### v1.0.0 — 2026-03-29
-- Initial release
 
 ---
 
