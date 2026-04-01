@@ -1,11 +1,10 @@
-**A native Bash installer for [Nginx Proxy Manager](https://nginxproxymanager.com/) on Debian and Ubuntu — no Docker required.**
-
-<img width="945" height="767" alt="native-npm-installer" src="https://github.com/user-attachments/assets/a9a28be8-9a37-464f-a889-b8c137efca33" />
-
+**A native Bash installer for [Nginx Proxy Manager](https://nginxproxymanager.com/) on Debian and Ubuntu — no Docker required.** <img width="945" height="767" alt="native-npm-installer" src="https://github.com/user-attachments/assets/a9a28be8-9a37-464f-a889-b8c137efca33" />
 
 ## Why this exists
 
-Most Nginx Proxy Manager installation guides assume Docker. The official project ships as a Docker image, and the popular [Proxmox Community Scripts](https://community-scripts.github.io/ProxmoxVE/) LXC installer still pulls a Docker image inside the container. If you want NPM running natively on bare Debian or Ubuntu — managed by systemd, backed by SQLite, with no container layer — there was no clean, maintained path to get there. This script fills that gap.
+Most Nginx Proxy Manager installation guides assume Docker. The official project ships as a Docker image, and the popular [Proxmox Community Scripts](https://community-scripts.github.io/ProxmoxVE/) LXC installer still pulls a Docker image inside the container. If you want NPM running natively on bare Debian or Ubuntu — managed by systemd, backed by SQLite, with no container layer — there was no clean, maintained path to get there.
+
+This script fills that gap.
 
 ## What it does
 
@@ -31,9 +30,9 @@ Default credentials on first run: `admin@example.com` / `changeme` (you will be 
 
 ## Requirements
 
-| Requirement | Minimum                     |
+| Requirement | Minimum |
 | ----------- | --------------------------- |
-| OS          | Debian 12+ or Ubuntu 22.04+ |
+| OS | Debian 12+ or Ubuntu 22.04+ |
 
 ## Usage
 
@@ -71,18 +70,18 @@ Running the script without flags presents a menu:
 
 ## What gets installed
 
-| Component            | Location                                          |
+| Component | Location |
 | -------------------- | ------------------------------------------------- |
-| NPM backend          | `/opt/nginx-proxy-manager/backend/`               |
-| NPM frontend (built) | `/opt/nginx-proxy-manager/frontend/`              |
-| Data & config        | `/data/`                                          |
-| SQLite database      | `/data/database.sqlite`                           |
-| nginx config         | `/etc/nginx/nginx.conf`                           |
-| systemd service      | `/etc/systemd/system/nginx-proxy-manager.service` |
-| Let's Encrypt config | `/etc/letsencrypt.ini`                            |
-| Certbot work dir     | `/tmp/letsencrypt-lib/`                           |
-| ACME webroot         | `/data/letsencrypt-acme-challenge/`               |
-| Logs                 | `/data/logs/`                                     |
+| NPM backend | `/opt/nginx-proxy-manager/backend/` |
+| NPM frontend (built) | `/opt/nginx-proxy-manager/frontend/` |
+| Data & config | `/data/` |
+| SQLite database | `/data/database.sqlite` |
+| nginx config | `/etc/nginx/nginx.conf` |
+| systemd service | `/etc/systemd/system/nginx-proxy-manager.service` |
+| Let's Encrypt config | `/etc/letsencrypt.ini` |
+| Certbot work dir | `/tmp/letsencrypt-lib/` |
+| ACME webroot | `/data/letsencrypt-acme-challenge/` |
+| Logs | `/data/logs/` |
 
 ---
 
@@ -125,6 +124,18 @@ The script builds NPM entirely from source:
 6. **nginx config** — self-contained config with the custom variable maps (`$x_forwarded_scheme`, `$x_forwarded_proto`) that NPM's templates require
 7. **systemd service** — installs and enables `nginx-proxy-manager.service`, starts on boot
 
+### Build compatibility patches
+
+The NPM source tree requires several patches to build outside of the Docker CI environment:
+
+| Patch | Reason |
+|---|---|
+| `react-intl` pinned to `^10.0.0` | v8.x deprecated; v9.x broken/removed |
+| Locale JSON stubs generated | Crowdin-managed `lang/*.json` files are absent from git; missing files cause TS2307 errors |
+| `vite.config.ts` chunk splitting | Default build produces a single 2 MB chunk; split into parallel-loadable vendor chunks |
+| `tsconfig.json` test-file exclusion | `tsc && vite build` compiles `*.test.tsx` which references Node.js globals not typed in the browser tsconfig |
+| pnpm store prune before install | Prior failed installs leave corrupt entries in the global pnpm store; pruning prevents vite hangs on re-runs |
+
 ---
 
 ## Updating NPM
@@ -154,18 +165,51 @@ sudo rm -rf /opt/nginx-proxy-manager
 ---
 
 ## Verifying your installation
+
 After installing, use the built-in verify mode to confirm everything is working:
+
 ```bash
 sudo bash npm-installer.sh --verify
 ```
+
 This produces a full health-check dashboard covering services, network, API, SSL, configuration, and more — no separate tool needed.
+
+---
+
+## Changelog
+
+### v1.1.4 — 2026-04-01
+- **Fix:** Vite build hanging mid-transform on re-run machines — pnpm's global store retains corrupt entries from prior aborted installs, causing vite to deadlock reading incomplete module files
+
+### v1.1.3 — 2026-04-01
+- **Fix:** `tsconfig.json` JSONC patch failing to parse — NPM's tsconfig uses trailing commas which `json.loads()` rejects, causing the patch to silently skip and the build to still fail on test files
+
+### v1.1.2 — 2026-03-31
+- **Fix:** TypeScript build errors `TS2304`/`TS2580` — `tsc` compiled `Utils.test.tsx` which references Node.js globals not typed in the browser tsconfig
+
+### v1.1.1 — 2026-03-31
+- **Fix:** Access list save returning HTTP 500 — `/data/access/` directory not created at install time
+
+### v1.1.0 — 2026-03-31
+- **Fix:** DNS challenge certificates failing — `/opt/certbot` virtualenv not created at install time
+
+### v1.0.3 — 2026-03-30
+- **Fix:** Custom SSL certificate upload crashing — `/data/custom_ssl/` directory not created at install time
+
+### v1.0.2 — 2026-03-29
+- **Fix:** Services not starting correctly after install — nginx restart and service enable sequencing
+
+### v1.0.1 — 2026-03-29
+- **Fix:** Services not auto-starting after reboot — `systemctl enable` silently failed when wrapped in the output suppressor
+
+### v1.0.0 — 2026-03-29
+- Initial release
 
 ---
 
 ## Troubleshooting
 
 **NPM web UI not accessible after reboot**
-
 ```bash
 sudo systemctl status nginx nginx-proxy-manager
 sudo systemctl start nginx
@@ -173,18 +217,17 @@ sudo systemctl start nginx-proxy-manager
 ```
 
 **nginx config fails**
-
 ```bash
 sudo nginx -t
 ```
 
 **Check NPM backend logs**
-
 ```bash
 sudo journalctl -u nginx-proxy-manager -n 50 --no-pager
 ```
 
 **SSL certificate request fails**
+
 Ensure port 80 is open and reachable from the internet for HTTP-01 ACME challenges. Check `/data/logs/` for certbot output.
 
 ---
