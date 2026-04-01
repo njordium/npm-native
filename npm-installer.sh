@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.2 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.4 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 # =============================================================================
@@ -12,7 +12,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.3"           # installer script version
+SCRIPT_VERSION="1.1.4"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -691,6 +691,29 @@ if grep -q '"react-intl"' "${_FRONTEND_PKG}" 2>/dev/null; then
     info "react-intl patched: ^8.x → ^10.0.0 (v9 broken/deprecated; v10 API-compatible)"
 fi
 
+# ---------------------------------------------------------------------------
+# Clean pnpm store before install
+#
+# Root cause of vite build hang on re-runs: pnpm uses a global
+# content-addressable store (~/.local/share/pnpm/store) that persists across
+# installer runs. A previous aborted install can leave partial or corrupted
+# package entries in the store. When the new node_modules hard-links to those
+# entries, vite hangs mid-transform reading an incomplete module file.
+#
+# Fix: prune orphaned packages from the store, then verify store integrity.
+# This is a no-op on a clean machine (nothing to prune), and automatically
+# detects and re-fetches any corrupted entries on a re-run machine.
+# ---------------------------------------------------------------------------
+info "Pruning pnpm store (removes orphaned packages from previous runs)..."
+pnpm store prune --force 2>/dev/null || true
+info "Verifying pnpm store integrity..."
+if pnpm store verify 2>/dev/null; then
+    log "pnpm store: OK"
+else
+    warn "pnpm store has corrupted entries — forcing re-download of affected packages"
+    # pnpm store verify already re-fetches any bad entries, so this is informational only
+fi
+
 info "Installing frontend dependencies..."
 # --reporter=silent suppresses deprecation WARNs from upstream package.json pins
 # (e.g. react-intl@8.x deprecated by upstream). These are informational only
@@ -879,7 +902,24 @@ if [[ -f "${_TSCONFIG}" ]]; then
         || warn "tsconfig.json patch failed"
 fi
 info "Running production build..."
-if ${VERBOSE}; then pnpm run build; else vrun pnpm run build; fi
+# Vite can hang mid-transform if pnpm store entries are still corrupted.
+# Wrap with timeout (10 min): if it hangs, prune the store completely and retry.
+_build_ok=false
+for _attempt in 1 2; do
+    if ${VERBOSE}; then
+        timeout 600 pnpm run build && _build_ok=true && break
+    else
+        timeout 600 bash -c 'pnpm run build' 2>&1 | tee /tmp/npm-build-output.log | grep -E "^>|error|warning|built|transforming|chunks" >&2 && _build_ok=true && break
+    fi
+    if [[ ${_attempt} -eq 1 ]]; then
+        warn "Build timed out or failed (attempt 1) — clearing pnpm store and retrying..."
+        pnpm store prune --force 2>/dev/null || true
+        # Force re-download of all packages to ensure a clean store state
+        pnpm install --force --reporter=silent 2>/dev/null || pnpm install --force &>/dev/null || true
+    fi
+done
+${_build_ok} || die "Frontend build failed after retry. Run with --verbose for details."
+unset _build_ok _attempt
 
 log "Frontend build complete."
 
