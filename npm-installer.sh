@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.4 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.5 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 # =============================================================================
@@ -12,7 +12,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.4"           # installer script version
+SCRIPT_VERSION="1.1.5"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -951,9 +951,11 @@ mkdir -p "${NPM_HOME}"
 info "Copying backend source files..."
 if command -v rsync &>/dev/null; then
     vrun rsync -a --exclude='node_modules' --exclude='pnpm-lock.yaml' "${NPM_TMP}/backend/" "${NPM_HOME}/backend/"
+else
     mkdir -p "${NPM_HOME}/backend"
-    # shellcheck disable=SC2046
-    cp -r $(find "${NPM_TMP}/backend" -mindepth 1 -maxdepth 1         ! -name 'node_modules' -printf '%p ') "${NPM_HOME}/backend/" 2>/dev/null ||     ( cd "${NPM_TMP}/backend" && find . -mindepth 1 -maxdepth 1         ! -name 'node_modules' -exec cp -r {} "${NPM_HOME}/backend/" \; )
+    ( cd "${NPM_TMP}/backend" && find . -mindepth 1 -maxdepth 1 \
+        ! -name 'node_modules' ! -name 'pnpm-lock.yaml' \
+        -exec cp -a {} "${NPM_HOME}/backend/" \; )
 fi
 
 # Also copy the pnpm-lock.yaml for reproducible install
@@ -1413,8 +1415,8 @@ http {
     log_format standard '[$time_local] $status - $request_method $scheme $host "$request_uri" [Client $remote_addr] [Length $body_bytes_sent] [Gzip $gzip_ratio] "$http_user_agent" "$http_referer"';
     log_format proxy    '[$time_local] $status - $request_method $scheme $host "$request_uri" [Client $remote_addr] [Length $body_bytes_sent] [Gzip $gzip_ratio] "$http_user_agent" "$http_referer"';
 
-    access_log /data/logs/fallback_access.log standard;
-    error_log  /data/logs/fallback_error.log  warn;
+    access_log __NPM_DATA__/logs/fallback_access.log standard;
+    error_log  __NPM_DATA__/logs/fallback_error.log  warn;
 
     # ── Variables required by NPM's proxy_host.conf template ─────────────────
     # $x_forwarded_proto and $x_forwarded_scheme are NOT built-in nginx variables.
@@ -1440,7 +1442,7 @@ http {
     set_real_ip_from 10.0.0.0/8;
     set_real_ip_from 172.16.0.0/12;
     set_real_ip_from 192.168.0.0/16;
-    include /etc/nginx/conf.d/include/ip_ranges.conf;
+    include /etc/nginx/conf.d/include/ip_ranges[.]conf;
     real_ip_header    X-Real-IP;
     real_ip_recursive on;
 
@@ -1448,20 +1450,20 @@ http {
     include /etc/nginx/conf.d/include/resolvers.conf;
 
     # ── NPM runtime proxy configs ──────────────────────────────────────────────
-    include /data/nginx/default_host/*.conf;
-    include /data/nginx/proxy_host/*.conf;
-    include /data/nginx/redirection_host/*.conf;
-    include /data/nginx/dead_host/*.conf;
-    include /data/nginx/temp/*.conf;
+    include __NPM_DATA__/nginx/default_host/*.conf;
+    include __NPM_DATA__/nginx/proxy_host/*.conf;
+    include __NPM_DATA__/nginx/redirection_host/*.conf;
+    include __NPM_DATA__/nginx/dead_host/*.conf;
+    include __NPM_DATA__/nginx/temp/*.conf;
 
     # ── Custom snippets ────────────────────────────────────────────────────────
-    include /data/nginx/custom/http_top[.]conf;
-    include /data/nginx/custom/http[.]conf;
+    include __NPM_DATA__/nginx/custom/http_top[.]conf;
+    include __NPM_DATA__/nginx/custom/http[.]conf;
 
     # ── Admin UI — port 81 ────────────────────────────────────────────────────
     # NPM 2.13.x ARCHITECTURE:
     #   - Node.js backend: pure API on port 3000 (NO express.static)
-    #   - React frontend: static files served by nginx from /opt/nginx-proxy-manager/frontend/
+    #   - React frontend: static files served by nginx from __NPM_HOME__/frontend/
     #   - nginx port 81: serves static files + proxies /api/* to port 3000
     #
     # The backend has no static file serving — nginx owns the entire admin UI.
@@ -1469,11 +1471,11 @@ http {
         listen 81;
         listen [::]:81;
         server_name _;
-        access_log /data/logs/fallback_access.log standard;
-        error_log  /data/logs/fallback_error.log  warn;
+        access_log __NPM_DATA__/logs/fallback_access.log standard;
+        error_log  __NPM_DATA__/logs/fallback_error.log  warn;
 
         # Serve the React SPA static files directly
-        root /opt/nginx-proxy-manager/frontend;
+        root __NPM_HOME__/frontend;
         index index.html;
 
         # API requests → Node.js backend on port 3000
@@ -1507,9 +1509,13 @@ http {
 
 # Stream block for TCP/UDP proxying
 stream {
-    include /data/nginx/stream/*.conf;
+    include __NPM_DATA__/nginx/stream/*.conf;
 }
 NGINX_CONF
+
+# Replace placeholders with actual paths (keeps heredoc single-quoted to avoid
+# escaping dozens of nginx $ variables)
+sed -i "s|__NPM_HOME__|${NPM_HOME}|g; s|__NPM_DATA__|${NPM_DATA}|g" /etc/nginx/nginx.conf
 
 # Symlink for tools that expect /etc/nginx/conf/nginx.conf
 ln -sf /etc/nginx/nginx.conf /etc/nginx/conf/nginx.conf 2>/dev/null || true
@@ -1646,9 +1652,12 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=npm
+# Runs as root: required for certbot privileged operations, nginx reload,
+# and binding to ports 80/443. NoNewPrivileges prevents child processes
+# from gaining additional privileges via setuid/setgid binaries.
 User=root
 Group=root
-NoNewPrivileges=no
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target
