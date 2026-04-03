@@ -11,7 +11,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
@@ -55,6 +55,11 @@ section(){ echo -e "\n${BOLD}── $* ──${NC}"; }
 timestamp()     { date '+%Y-%m-%d-%H%M%S'; }
 datestamp()     { date '+%Y-%m-%d %H:%M:%S'; }
 native_is_running() { systemctl is-active --quiet "${NATIVE_SERVICE}" 2>/dev/null; }
+
+# Global cleanup path — set by do_backup/do_recover, used by EXIT trap
+_CLEANUP_DIR=""
+_cleanup() { [[ -n "${_CLEANUP_DIR}" ]] && rm -rf "${_CLEANUP_DIR}"; }
+trap _cleanup EXIT
 
 copy_dir() {
     local src="$1" dst="$2"
@@ -153,7 +158,7 @@ do_backup() {
 
     local staging
     staging=$(mktemp -d /tmp/npm-backup-staging.XXXXXX)
-    trap "rm -rf '${staging}'" EXIT
+    _CLEANUP_DIR="${staging}"
 
     # Step 1: Manifest
     echo -e "  ${BOLD}Step 1/5 — Manifest${NC}"
@@ -271,7 +276,7 @@ do_recover() {
     local staging
     staging=$(extract_archive "${archive}")
     local staging_root; staging_root=$(dirname "${staging}")
-    trap "rm -rf '${staging_root}'" EXIT
+    _CLEANUP_DIR="${staging_root}"
 
     # Show manifest
     if [[ -f "${staging}/${MANIFEST_FILE}" ]]; then
@@ -365,6 +370,8 @@ do_recover() {
     if command -v rsync &>/dev/null; then
         rsync -a --delete "${staging}/${DATA_SUBDIR}/" "${NATIVE_DATA_DIR}/"
     else
+        # Clean target first to match rsync --delete (remove stale files)
+        rm -rf "${NATIVE_DATA_DIR:?}/"*
         cp -a "${staging}/${DATA_SUBDIR}/." "${NATIVE_DATA_DIR}/"
     fi
     _pdone "/data/ restored"
@@ -379,6 +386,7 @@ do_recover() {
         if command -v rsync &>/dev/null; then
             rsync -a --delete "${staging}/${LETSENCRYPT_SUBDIR}/" "${NATIVE_LETSENCRYPT_DIR}/"
         else
+            rm -rf "${NATIVE_LETSENCRYPT_DIR:?}/"*
             cp -a "${staging}/${LETSENCRYPT_SUBDIR}/." "${NATIVE_LETSENCRYPT_DIR}/"
         fi
         local cert_count
@@ -396,6 +404,7 @@ do_recover() {
         if command -v rsync &>/dev/null; then
             rsync -a --delete "${staging}/${CERTBOT_VENV_SUBDIR}/" "${NATIVE_CERTBOT_VENV_DIR}/"
         else
+            rm -rf "${NATIVE_CERTBOT_VENV_DIR:?}/"*
             cp -a "${staging}/${CERTBOT_VENV_SUBDIR}/." "${NATIVE_CERTBOT_VENV_DIR}/"
         fi
         _pdone "certbot venv restored (DNS challenge plugins ready)"
