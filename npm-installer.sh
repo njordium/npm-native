@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.5 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.6 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 # =============================================================================
@@ -12,16 +12,26 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.5"           # installer script version
+SCRIPT_VERSION="1.1.6"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
 NPM_DATA="${NPM_DATA:-/data}"
 NPM_TMP="/tmp/npm-build"
+# Validate paths — unsafe characters would break sed substitution in nginx.conf
+[[ "${NPM_HOME}" =~ [^a-zA-Z0-9/_.-] ]] && { echo "FATAL: NPM_HOME contains unsafe characters: ${NPM_HOME}" >&2; exit 1; }
+[[ "${NPM_DATA}" =~ [^a-zA-Z0-9/_.-] ]] && { echo "FATAL: NPM_DATA contains unsafe characters: ${NPM_DATA}" >&2; exit 1; }
 NPM_SERVICE="nginx-proxy-manager"
 ADMIN_PORT=81
 INSTALL_MODE=""   # fresh | update | verify  (set by mode selection below)
 VERBOSE=false     # true = show all step output, false = quiet (main steps only)
+
+# Secure temp files — mktemp prevents symlink attacks in /tmp
+_VITE_PATCH=$(mktemp /tmp/npm-vite-patch.XXXXXX.py)
+_TSCONFIG_PATCH=$(mktemp /tmp/npm-tsconfig-patch.XXXXXX.py)
+_BUILD_LOG=$(mktemp /tmp/npm-build-output.XXXXXX.log)
+_tmp_cleanup() { rm -f "${_VITE_PATCH:-}" "${_TSCONFIG_PATCH:-}" "${_BUILD_LOG:-}"; }
+trap _tmp_cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # ANSI colours
@@ -103,12 +113,28 @@ echo -e "  ${BOLD}${GREEN}Nginx Proxy Manager${NC}${BOLD} — Native Linux Insta
 echo -e "  ${DIM}No Docker · SQLite · Systemd · Team Njordium${NC}"
 echo -e "  ${DIM}---------------------------------------------${NC}"
 echo ""
+_TOTAL_RAM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo "0")
 echo -e "  ${CYAN}Version  :${NC} ${BOLD}v${NPM_VERSION}${NC}     ${CYAN}Node.js :${NC} ${BOLD}v${NODE_MAJOR} LTS${NC}"
 echo -e "  ${CYAN}Install  :${NC} ${NPM_HOME}"
 echo -e "  ${CYAN}Data     :${NC} ${NPM_DATA}"
 echo -e "  ${CYAN}Database :${NC} SQLite (${NPM_DATA}/database.sqlite)"
 echo -e "  ${CYAN}Service  :${NC} ${NPM_SERVICE}"
+echo -e "  ${CYAN}Memory   :${NC} ${_TOTAL_RAM_MB} MB   ${CYAN}Minimum :${NC} ${BOLD}2048 MB (2 GB)${NC}"
 echo ""
+if [[ "${_TOTAL_RAM_MB}" -gt 0 && "${_TOTAL_RAM_MB}" -lt 2048 ]]; then
+    echo -e "  ${RED}${BOLD}WARNING: This system has ${_TOTAL_RAM_MB} MB RAM.${NC}"
+    echo -e "  ${RED}The frontend build requires at least 2 GB RAM.${NC}"
+    echo -e "  ${RED}The build will likely fail with out-of-memory errors.${NC}"
+    echo -e "  ${YELLOW}Recommendation: Increase RAM to 2 GB or add swap space.${NC}"
+    echo ""
+    if [[ -t 0 ]]; then
+        read -rp "  Continue anyway? [y/N]: " _RAM_CONFIRM || true
+        [[ "${_RAM_CONFIRM,,}" == "y" || "${_RAM_CONFIRM,,}" == "yes" ]] || { echo ""; echo "  Aborted."; exit 1; }
+        echo ""
+    else
+        warn "Low RAM detected (${_TOTAL_RAM_MB} MB) — build may fail. Use --verbose for details."
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Root check
@@ -229,11 +255,14 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     _pwarn(){ echo -e "  ${YELLOW}[WARN]${NC} $*"; (( _WARN += 1 )) || true; }
     _sect() { echo ""; echo -e "${BOLD}── $* ──${NC}"; }
 
+    # Cache host IP once for all verify output
+    HOST_IP=$(hostname -I | awk '{print $1}')
+
     echo ""
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${CYAN}║   Nginx Proxy Manager — Installation Verification            ║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo -e "  ${DIM}Host: $(hostname)   IP: $(hostname -I | awk '{print $1}')   $(date '+%Y-%m-%d %H:%M:%S')${NC}"
+    echo -e "  ${DIM}Host: $(hostname)   IP: ${HOST_IP}   $(date '+%Y-%m-%d %H:%M:%S')${NC}"
 
     # ── Services ─────────────────────────────────────────────────────────────
     _sect "Services"
@@ -305,7 +334,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     _UI_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null || echo "000")
     _UI_CT=$(curl -s -I --max-time 4 "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null | grep -i "^content-type" | tr -d '\r' | head -1)
     if [[ "${_UI_HTTP}" =~ ^[23] ]]; then
-        _pok  "admin UI             http://$(hostname -I | awk '{print $1}'):${ADMIN_PORT}/ -> HTTP ${_UI_HTTP}"
+        _pok  "admin UI             http://${HOST_IP}:${ADMIN_PORT}/ -> HTTP ${_UI_HTTP}"
     else
         _pfail "admin UI             port ${ADMIN_PORT} not responding (HTTP ${_UI_HTTP})"
     fi
@@ -337,7 +366,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     if [[ "${_SETUP_RESP}" == "setup_done" ]]; then
         _pok  "admin account        created — setup wizard complete"
     elif [[ "${_SETUP_RESP}" == "setup_needed" ]]; then
-        _pwarn "admin account        NOT created yet — visit http://$(hostname -I | awk '{print $1}'):${ADMIN_PORT}/ to set up"
+        _pwarn "admin account        NOT created yet — visit http://${HOST_IP}:${ADMIN_PORT}/ to set up"
     else
         _pwarn "admin account        could not determine setup state"
     fi
@@ -375,8 +404,8 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     _sect "Configuration"
     _PROD="${NPM_HOME}/backend/config/production.json"
     if [[ -f "${_PROD}" ]]; then
-        _DB_CLIENT=$(python3 -c "import json; d=json.load(open('${_PROD}')); print(d['database']['knex']['client'])" 2>/dev/null || echo "?")
-        _DB_FILE=$(python3 -c "import json; d=json.load(open('${_PROD}')); print(d['database']['knex']['connection']['filename'])" 2>/dev/null || echo "?")
+        _DB_CLIENT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['database']['knex']['client'])" "${_PROD}" 2>/dev/null || echo "?")
+        _DB_FILE=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['database']['knex']['connection']['filename'])" "${_PROD}" 2>/dev/null || echo "?")
         if [[ "${_DB_CLIENT}" == "better-sqlite3" ]]; then
             _pok  "db client            ${_DB_CLIENT} (isSqlite()=true → uses datetime('now'))"
         else
@@ -427,7 +456,6 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     else
         echo -e "  ${GREEN}${BOLD}✓  All checks passed. NPM is healthy and fully operational.${NC}"
     fi
-    HOST_IP=$(hostname -I | awk '{print $1}')
     echo ""
     echo -e "  ${CYAN}Admin Panel :${NC} ${BOLD}http://${HOST_IP}:${ADMIN_PORT}${NC}"
     echo -e "  ${CYAN}Version     :${NC} ${_VER_CURRENT}"
@@ -452,6 +480,7 @@ if [[ "${INSTALL_MODE}" == "fresh" ]]; then
     if [[ -f "${NPM_DATA}/database.sqlite" ]]; then
         DB_BACKUP="${NPM_DATA}/database.sqlite.bak.$(date +%Y%m%d%H%M%S)"
         cp "${NPM_DATA}/database.sqlite" "${DB_BACKUP}"
+        [[ -f "${DB_BACKUP}" ]] || die "Database backup failed — refusing to delete original"
         warn "Database backed up to: ${DB_BACKUP}"
         rm -f "${NPM_DATA}/database.sqlite"
         info "Database wiped — starting fresh."
@@ -461,12 +490,32 @@ elif [[ "${INSTALL_MODE}" == "update" ]]; then
     if ${_HAS_DB}; then
         DB_BACKUP="${NPM_DATA}/database.sqlite.bak.$(date +%Y%m%d%H%M%S)"
         cp "${NPM_DATA}/database.sqlite" "${DB_BACKUP}"
+        [[ -f "${DB_BACKUP}" ]] || die "Database backup failed — refusing to proceed"
         log "Database backed up to: ${DB_BACKUP}"
     fi
     info "Database preserved — update mode."
 fi
 echo ""
 
+# ---------------------------------------------------------------------------
+# Optional: system upgrade (fresh install only)
+# ---------------------------------------------------------------------------
+if [[ "${INSTALL_MODE}" == "fresh" ]] && [[ -t 0 ]]; then
+    echo -e "  ${BOLD}System package upgrade${NC}"
+    echo -e "  ${DIM}Updating system packages ensures a clean foundation for the install.${NC}"
+    echo ""
+    read -rp "  Run apt update && apt upgrade before installing? [y/N]: " _UPG_CHOICE || true
+    if [[ "${_UPG_CHOICE,,}" == "y" || "${_UPG_CHOICE,,}" == "yes" ]]; then
+        step "Updating system packages (apt update && apt upgrade)"
+        export DEBIAN_FRONTEND=noninteractive
+        vrun apt-get update -qq
+        vrun apt-get upgrade -y -qq
+        log "System packages updated."
+    else
+        echo -e "  ${DIM}Skipped — continuing with current package versions.${NC}"
+    fi
+    echo ""
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1 — System dependencies
@@ -616,7 +665,7 @@ log "Source cloned to ${NPM_TMP}"
 step "Step 4/7 — Building frontend (this may take a few minutes)"
 
 # Write the vite chunk-splitting patch script to /tmp (used later in this step)
-cat > /tmp/_vite_patch.py << 'VITE_PATCH_EOF'
+cat > "${_VITE_PATCH}" << 'VITE_PATCH_EOF'
 import re, sys
 cfg_path = sys.argv[1]
 with open(cfg_path) as f:
@@ -832,7 +881,7 @@ info "Locale check complete."
 # parallel-loadable vendor chunks, eliminating the "> 500 kB" build warning.
 _VITE_CFG="${NPM_TMP}/frontend/vite.config.ts"
 if [[ -f "${_VITE_CFG}" ]]; then
-    python3 /tmp/_vite_patch.py "${_VITE_CFG}" \
+    python3 "${_VITE_PATCH}" "${_VITE_CFG}" \
         && info "vite.config.ts: manualChunks applied (vendor chunk splitting)" \
         || warn "vite.config.ts patch failed — build continues without chunk split"
 fi
@@ -847,7 +896,7 @@ fi
 #   2. Fallback: if parsing fails, delete the test files from the build tree
 #      directly — they have no role in a production build.
 # NOTE: written to a temp file so the heredoc sits at column 0.
-cat > /tmp/_tsconfig_patch.py << 'TSCONFIG_PATCH_EOF'
+cat > "${_TSCONFIG_PATCH}" << 'TSCONFIG_PATCH_EOF'
 import sys, json, re, os, glob
 
 path = sys.argv[1]
@@ -897,19 +946,59 @@ TSCONFIG_PATCH_EOF
 
 _TSCONFIG="${NPM_TMP}/frontend/tsconfig.json"
 if [[ -f "${_TSCONFIG}" ]]; then
-    python3 /tmp/_tsconfig_patch.py "${_TSCONFIG}" \
+    python3 "${_TSCONFIG_PATCH}" "${_TSCONFIG}" \
         && info "tsconfig.json: test files excluded from production build" \
         || warn "tsconfig.json patch failed"
 fi
 info "Running production build..."
+echo ""
+echo -e "  ${YELLOW}${BOLD}Building frontend — this may take 3-5 minutes.${NC}"
+echo -e "  ${DIM}Vite transforms ~7000 modules. Please be patient.${NC}"
+echo ""
+
 # Vite can hang mid-transform if pnpm store entries are still corrupted.
 # Wrap with timeout (10 min): if it hangs, prune the store completely and retry.
+
+# _build_with_progress: run pnpm build in background, show a live spinner
+# with elapsed time and the latest transforming count from the build log.
+# On failure, dump the last 20 lines of the log so the user sees the error.
+_build_with_progress() {
+    : > "${_BUILD_LOG}"  # truncate log
+    timeout 600 bash -c 'export NODE_OPTIONS="--max-old-space-size=2048"; pnpm run build' > "${_BUILD_LOG}" 2>&1 &
+    local _pid=$!
+    local _spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local _start=${SECONDS}
+    local _i=0 _status=0 _elapsed _last_line
+
+    while kill -0 "${_pid}" 2>/dev/null; do
+        _elapsed=$(( SECONDS - _start ))
+        _last_line=$(grep -oP 'transforming \(\d+\)|built in|error' "${_BUILD_LOG}" 2>/dev/null | tail -1 || true)
+        [[ -z "${_last_line}" ]] && _last_line="starting..."
+        printf "\r  ${CYAN}%s${NC}  %dm%02ds  %s     " \
+            "${_spin:_i++%${#_spin}:1}" \
+            $(( _elapsed / 60 )) $(( _elapsed % 60 )) \
+            "${_last_line}"
+        sleep 0.3
+    done
+    wait "${_pid}" 2>/dev/null || _status=$?
+    printf "\r%80s\r" ""   # clear the spinner line
+
+    if [[ ${_status} -ne 0 ]]; then
+        echo ""
+        warn "Build failed (exit code ${_status}). Last 20 lines of build output:"
+        echo -e "${DIM}"
+        tail -20 "${_BUILD_LOG}" 2>/dev/null || true
+        echo -e "${NC}"
+    fi
+    return ${_status}
+}
+
 _build_ok=false
 for _attempt in 1 2; do
     if ${VERBOSE}; then
-        timeout 600 pnpm run build && _build_ok=true && break
+        NODE_OPTIONS="--max-old-space-size=2048" timeout 600 pnpm run build && _build_ok=true && break
     else
-        timeout 600 bash -c 'pnpm run build' 2>&1 | tee /tmp/npm-build-output.log | grep -E "^>|error|warning|built|transforming|chunks" >&2 && _build_ok=true && break
+        _build_with_progress && { _build_ok=true; break; }
     fi
     if [[ ${_attempt} -eq 1 ]]; then
         warn "Build timed out or failed (attempt 1) — clearing pnpm store and retrying..."
@@ -970,10 +1059,10 @@ fi
 # correct version string is baked in when systemd starts the service.
 # Result: footer shows v${NPM_VERSION} and update_available = false.
 _PKGJSON="${NPM_HOME}/backend/package.json"
-_BEFORE=$(python3 -c "import json; print(json.load(open('${_PKGJSON}'))['version'])" 2>/dev/null || echo "?")
+_BEFORE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['version'])" "${_PKGJSON}" 2>/dev/null || echo "?")
 jq --arg v "${NPM_VERSION}" '.version = $v' "${_PKGJSON}" > "${_PKGJSON}.tmp" \
     && mv "${_PKGJSON}.tmp" "${_PKGJSON}"
-_AFTER=$(python3 -c "import json; print(json.load(open('${_PKGJSON}'))['version'])" 2>/dev/null || echo "error")
+_AFTER=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['version'])" "${_PKGJSON}" 2>/dev/null || echo "error")
 if [[ "${_AFTER}" == "${NPM_VERSION}" ]]; then
     info "Version patched: ${_BEFORE} → v${_AFTER}"
 else
