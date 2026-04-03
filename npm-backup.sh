@@ -11,7 +11,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
@@ -98,7 +98,13 @@ extract_archive() {
     local staging
     staging=$(mktemp -d /tmp/npm-restore-staging.XXXXXX)
     _pinfo "Extracting archive..." >&2
-    tar -xzf "${archive}" -C "${staging}" || die "Failed to extract archive — file may be corrupt"
+    # Security: check for path traversal entries before extracting
+    if tar -tzf "${archive}" 2>/dev/null | grep -qE '^\.\./|/\.\./'; then
+        rm -rf "${staging}"
+        die "Archive contains path traversal entries (../) — refusing to extract"
+    fi
+    tar --no-same-owner -xzf "${archive}" -C "${staging}" || die "Failed to extract archive — file may be corrupt"
+    chmod -R go= "${staging}"
     local inner
     inner=$(find "${staging}" -mindepth 1 -maxdepth 1 -type d | head -1)
     [[ -d "${inner}" ]] || die "Archive structure unexpected — no subdirectory found inside"
@@ -186,11 +192,14 @@ do_backup() {
     echo -e "  ${BOLD}Step 3/5 — Backing up /etc/letsencrypt/${NC}"
     if [[ -d "${NATIVE_LETSENCRYPT_DIR}" ]]; then
         mkdir -p "${staging}/${LETSENCRYPT_SUBDIR}"
-        copy_dir "${NATIVE_LETSENCRYPT_DIR}" "${staging}/${LETSENCRYPT_SUBDIR}"
-        local le_size cert_count
-        le_size=$(du -sh "${staging}/${LETSENCRYPT_SUBDIR}" | cut -f1)
-        cert_count=$(find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null | wc -l)
-        _pdone "/etc/letsencrypt/ copied (${le_size}, ${cert_count} cert(s))"
+        if copy_dir "${NATIVE_LETSENCRYPT_DIR}" "${staging}/${LETSENCRYPT_SUBDIR}"; then
+            local le_size cert_count
+            le_size=$(du -sh "${staging}/${LETSENCRYPT_SUBDIR}" | cut -f1)
+            cert_count=$(find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+            _pdone "/etc/letsencrypt/ copied (${le_size}, ${cert_count} cert(s))"
+        else
+            _pwarn "/etc/letsencrypt/ copy failed — directory will not be in backup"
+        fi
     else
         _pskip "/etc/letsencrypt/ not found — skipped"
     fi
@@ -317,7 +326,7 @@ do_recover() {
 
     if [[ -d "${staging}/${LETSENCRYPT_SUBDIR}" ]]; then
         local cert_count
-        cert_count=$(find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null | wc -l)
+        cert_count=$(find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
         _pok  "letsencrypt/ present (${cert_count} cert(s))"; (( pass++ )) || true
     else
         _pwarn "letsencrypt/ not in archive — SSL certs will not be restored"; (( warn++ )) || true
@@ -371,7 +380,7 @@ do_recover() {
         rsync -a --delete "${staging}/${DATA_SUBDIR}/" "${NATIVE_DATA_DIR}/"
     else
         # Clean target first to match rsync --delete (remove stale files)
-        rm -rf "${NATIVE_DATA_DIR:?}/"*
+        find "${NATIVE_DATA_DIR:?}" -mindepth 1 -delete
         cp -a "${staging}/${DATA_SUBDIR}/." "${NATIVE_DATA_DIR}/"
     fi
     _pdone "/data/ restored"
@@ -386,11 +395,11 @@ do_recover() {
         if command -v rsync &>/dev/null; then
             rsync -a --delete "${staging}/${LETSENCRYPT_SUBDIR}/" "${NATIVE_LETSENCRYPT_DIR}/"
         else
-            rm -rf "${NATIVE_LETSENCRYPT_DIR:?}/"*
+            find "${NATIVE_LETSENCRYPT_DIR:?}" -mindepth 1 -delete
             cp -a "${staging}/${LETSENCRYPT_SUBDIR}/." "${NATIVE_LETSENCRYPT_DIR}/"
         fi
         local cert_count
-        cert_count=$(find "${NATIVE_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null | wc -l)
+        cert_count=$(find "${NATIVE_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
         _pdone "/etc/letsencrypt/ restored (${cert_count} cert(s))"
     else
         _pskip "letsencrypt/ not in archive — skipped"
@@ -404,7 +413,7 @@ do_recover() {
         if command -v rsync &>/dev/null; then
             rsync -a --delete "${staging}/${CERTBOT_VENV_SUBDIR}/" "${NATIVE_CERTBOT_VENV_DIR}/"
         else
-            rm -rf "${NATIVE_CERTBOT_VENV_DIR:?}/"*
+            find "${NATIVE_CERTBOT_VENV_DIR:?}" -mindepth 1 -delete
             cp -a "${staging}/${CERTBOT_VENV_SUBDIR}/." "${NATIVE_CERTBOT_VENV_DIR}/"
         fi
         _pdone "certbot venv restored (DNS challenge plugins ready)"
