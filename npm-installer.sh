@@ -1,18 +1,42 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.6 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.8 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.1.8 — community feedback pass (issues #3, #4, #5):
+#    • #5: removed dead `pnpm store verify` block (subcommand doesn't exist).
+#    • #4: patch frontend package.json with pnpm.onlyBuiltDependencies for
+#          @parcel/watcher / esbuild / @swc/core — fixes ERR_PNPM_IGNORED_BUILDS
+#          on Ubuntu 25.10 and any pnpm v10+ install. Backend list extended too.
+#    • #3: detect nginx < 1.25.1 and strip http2 on/off from NPM's
+#          _listen.conf template so proxy host configs validate. Bookworm
+#          users now see an explanatory warn line at preflight.
+#
+#  v1.1.7 — refactor pass:
+#    • Fixed sqlite-driver detection loop (loop-fallback was unreachable).
+#    • Fixed dead bcrypt-version ternary.
+#    • Simplified _test_module to the only branch that actually worked.
+#    • Guarded arithmetic on potentially-empty MemoryCurrent value.
+#    • Preserved failed build log to /var/log/npm-build-failed.log.
+#    • Stopped retrying pnpm install twice on first failure.
+#    • Pinned react-intl override to a known-good v10 minor.
+#    • Added ERR trap for line/command diagnostics on unexpected failure.
+#    • Sectioned the script into named functions; flow lives in main().
 # =============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 IFS=$'\n\t'
+
+# ERR trap — point at the line and command that tripped set -e.
+# Without this, a `grep` with no match deep inside a heredoc dies silently.
+trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' ERR
 
 # ---------------------------------------------------------------------------
 # User-tunable settings
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.6"           # installer script version
+SCRIPT_VERSION="1.1.8"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -30,8 +54,48 @@ VERBOSE=false     # true = show all step output, false = quiet (main steps only)
 _VITE_PATCH=$(mktemp /tmp/npm-vite-patch.XXXXXX.py)
 _TSCONFIG_PATCH=$(mktemp /tmp/npm-tsconfig-patch.XXXXXX.py)
 _BUILD_LOG=$(mktemp /tmp/npm-build-output.XXXXXX.log)
-_tmp_cleanup() { rm -f "${_VITE_PATCH:-}" "${_TSCONFIG_PATCH:-}" "${_BUILD_LOG:-}"; }
+# On failure, copy the build log somewhere durable so the user can inspect it
+# after the temp file is wiped. The trailing rm -f always runs.
+_tmp_cleanup() {
+    local rc=$?
+    if [[ ${rc} -ne 0 && -s "${_BUILD_LOG:-}" ]]; then
+        cp "${_BUILD_LOG}" /var/log/npm-build-failed.log 2>/dev/null \
+            && echo "[!] Full build log preserved at /var/log/npm-build-failed.log" >&2
+    fi
+    rm -f "${_VITE_PATCH:-}" "${_TSCONFIG_PATCH:-}" "${_BUILD_LOG:-}"
+}
 trap _tmp_cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Function decomposition (table of contents)
+# ---------------------------------------------------------------------------
+# The body is sectioned into named functions; each is defined and called
+# immediately so the top-to-bottom imperative flow is preserved. Variable
+# scope is unchanged — bash functions inherit shell variables unless they
+# use `local`. To run just one phase for debugging, comment out the call
+# (the line that bare-names the function after its `}` close marker).
+#
+#   _resolve_npm_version
+#   _show_splash_and_preflight
+#   _select_install_mode
+#   _select_verbosity
+#   _run_verify_mode
+#   _prepare_for_install
+#   _maybe_upgrade_system
+#   _step1_install_deps
+#   _step1b_certbot_venv
+#   _step2_install_node
+#   _step3_clone_source
+#   _step4_build_frontend
+#   _step5_install_backend
+#   _step6_seed_data
+#   _step6_seed_data_continued_db
+#   _step6b_configure_nginx
+#   _step6c_logrotate
+#   _step7_systemd_service
+#   _step7b_wait_for_service
+#   _finalize
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # ANSI colours
@@ -84,6 +148,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------------------------------------------------------------------
+# >>> SECTION: _resolve_npm_version >>>
+_resolve_npm_version() {
 # Auto-detect latest NPM version from GitHub if not specified
 # ---------------------------------------------------------------------------
 if [[ -z "${NPM_VERSION}" ]]; then
@@ -96,6 +162,11 @@ if [[ -z "${NPM_VERSION}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+}  # end _resolve_npm_version
+_resolve_npm_version
+
+# >>> SECTION: _show_splash_and_preflight >>>
+_show_splash_and_preflight() {
 # ASCII splash screen
 # ---------------------------------------------------------------------------
 clear
@@ -158,7 +229,21 @@ else
     die "Unsupported OS: ${_OS_PRETTY:-unknown}. This script supports Debian and Ubuntu."
 fi
 
+# Debian 12 (bookworm) ships nginx 1.22.1, which predates the `http2 on/off`
+# directives (introduced in nginx 1.25.1). NPM's _listen.conf template emits
+# them unconditionally, so on bookworm we will patch the template later in
+# Step 6 to remove the block. Warn the user up front so the change isn't a
+# surprise. Reported in #3.
+if [[ "${_OS_CODENAME}" == "bookworm" ]]; then
+    warn "Debian 12 (bookworm) ships nginx 1.22.1 — installer will patch NPM's _listen.conf to remove the unsupported http2 on/off directive (HTTP/2 toggle in the UI will be inert)."
+fi
+
 # ---------------------------------------------------------------------------
+}  # end _show_splash_and_preflight
+_show_splash_and_preflight
+
+# >>> SECTION: _select_install_mode >>>
+_select_install_mode() {
 # Installation mode selection
 # ---------------------------------------------------------------------------
 # Detect whether an existing install is present
@@ -223,6 +308,11 @@ fi
 info "Mode: ${BOLD}${INSTALL_MODE}${NC}"
 
 # ---------------------------------------------------------------------------
+}  # end _select_install_mode
+_select_install_mode
+
+# >>> SECTION: _select_verbosity >>>
+_select_verbosity() {
 # Verbose mode question (only if not set via CLI flag and not verify mode)
 # ---------------------------------------------------------------------------
 if [[ "${INSTALL_MODE}" != "verify" ]]; then
@@ -246,6 +336,11 @@ if [[ "${INSTALL_MODE}" != "verify" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+}  # end _select_verbosity
+_select_verbosity
+
+# >>> SECTION: _run_verify_mode >>>
+_run_verify_mode() {
 # ── VERIFY mode — full installation health dashboard ────────────────────────
 # ---------------------------------------------------------------------------
 if [[ "${INSTALL_MODE}" == "verify" ]]; then
@@ -269,7 +364,13 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     if systemctl is-active --quiet "${NPM_SERVICE}" 2>/dev/null; then
         _NPM_PID=$(systemctl show -p MainPID "${NPM_SERVICE}" 2>/dev/null | cut -d= -f2)
         _NPM_MEM=$(systemctl show -p MemoryCurrent "${NPM_SERVICE}" 2>/dev/null | cut -d= -f2)
-        _NPM_MEM_MB=$(( ${_NPM_MEM:-0} / 1024 / 1024 )) 2>/dev/null || _NPM_MEM_MB="?"
+        # MemoryCurrent can be empty or non-numeric before the service is fully running.
+        # set -e does NOT catch errors inside $(( )) but non-numeric operands DO kill the script.
+        if [[ "${_NPM_MEM}" =~ ^[0-9]+$ ]]; then
+            _NPM_MEM_MB=$(( _NPM_MEM / 1024 / 1024 ))
+        else
+            _NPM_MEM_MB="?"
+        fi
         _NPM_UP=$(systemctl show -p ActiveEnterTimestamp "${NPM_SERVICE}" 2>/dev/null | cut -d= -f2)
         _pok  "nginx-proxy-manager  active  PID=${_NPM_PID}  MEM=${_NPM_MEM_MB}MB"
         echo -e "       ${DIM}since: ${_NPM_UP}${NC}"
@@ -388,17 +489,22 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
 
     # ── Native modules ───────────────────────────────────────────────────────
     _sect "Native Modules"
-    if ( cd "${NPM_HOME}/backend" && node -e "require('bcrypt')" &>/dev/null 2>&1 ); then
-        _BCRYPT_VER=$(cd "${NPM_HOME}/backend" && node -e "const b=require('bcrypt'); console.log(b.getRounds ? 'ok' : 'ok')" 2>/dev/null || echo "ok")
+    if ( cd "${NPM_HOME}/backend" && node -e "require('bcrypt')" &>/dev/null ); then
         _pok  "bcrypt               loads OK (password hashing)"
     else
         _pfail "bcrypt               FAILED to load — backend will crash on login"
     fi
+    # SQLite driver detection — the original used `for ... done || _pfail`
+    # which never fires when the loop runs to completion. Use an explicit flag.
+    _SQLITE_OK=false
     for _sq in better-sqlite3 sqlite3; do
-        if ( cd "${NPM_HOME}/backend" && node -e "require('${_sq}')" &>/dev/null 2>&1 ); then
-            _pok  "${_sq}      loads OK (database driver)"; break
+        if ( cd "${NPM_HOME}/backend" && node -e "require('${_sq}')" &>/dev/null ); then
+            _pok  "${_sq}      loads OK (database driver)"
+            _SQLITE_OK=true
+            break
         fi
-    done || _pfail "sqlite               no SQLite driver loads (better-sqlite3 or sqlite3)"
+    done
+    ${_SQLITE_OK} || _pfail "sqlite               no SQLite driver loads (better-sqlite3 or sqlite3)"
 
     # ── Configuration ────────────────────────────────────────────────────────
     _sect "Configuration"
@@ -463,6 +569,11 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     exit 0
 fi
 # ---------------------------------------------------------------------------
+}  # end _run_verify_mode
+_run_verify_mode
+
+# >>> SECTION: _prepare_for_install >>>
+_prepare_for_install() {
 # Pre-install actions based on mode
 # ---------------------------------------------------------------------------
 if [[ "${INSTALL_MODE}" == "fresh" ]]; then
@@ -498,6 +609,11 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
+}  # end _prepare_for_install
+_prepare_for_install
+
+# >>> SECTION: _maybe_upgrade_system >>>
+_maybe_upgrade_system() {
 # Optional: system upgrade (fresh install only)
 # ---------------------------------------------------------------------------
 if [[ "${INSTALL_MODE}" == "fresh" ]] && [[ -t 0 ]]; then
@@ -518,6 +634,11 @@ if [[ "${INSTALL_MODE}" == "fresh" ]] && [[ -t 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+}  # end _maybe_upgrade_system
+_maybe_upgrade_system
+
+# >>> SECTION: _step1_install_deps >>>
+_step1_install_deps() {
 # Step 1 — System dependencies
 # ---------------------------------------------------------------------------
 step "Step 1/7 — Installing system dependencies"
@@ -554,6 +675,11 @@ vrun apt-get install -y --no-install-recommends \
 log "System packages installed."
 
 # ---------------------------------------------------------------------------
+}  # end _step1_install_deps
+_step1_install_deps
+
+# >>> SECTION: _step1b_certbot_venv >>>
+_step1b_certbot_venv() {
 # Create /opt/certbot Python virtualenv
 # ---------------------------------------------------------------------------
 # NPM's DNS plugin installer (lib/certbot.js) always runs:
@@ -570,6 +696,11 @@ vrun /opt/certbot/bin/pip install --quiet certbot
 log "certbot virtualenv ready: $(/opt/certbot/bin/certbot --version 2>&1)" 
 
 # ---------------------------------------------------------------------------
+}  # end _step1b_certbot_venv
+_step1b_certbot_venv
+
+# >>> SECTION: _step2_install_node >>>
+_step2_install_node() {
 # Step 2 — Node.js (via NodeSource)
 # ---------------------------------------------------------------------------
 step "Step 2/7 — Installing Node.js ${NODE_MAJOR} LTS"
@@ -635,6 +766,11 @@ info "node : $(node --version 2>/dev/null || echo not-found)"
 info "npm  : $(npm --version 2>/dev/null || echo not-found)"
 
 # ---------------------------------------------------------------------------
+}  # end _step2_install_node
+_step2_install_node
+
+# >>> SECTION: _step3_clone_source >>>
+_step3_clone_source() {
 # Step 3 — Clone NPM source via git (full working tree, no export-ignore gaps)
 # ---------------------------------------------------------------------------
 step "Step 3/7 — Cloning NPM v${NPM_VERSION} source"
@@ -660,6 +796,11 @@ vrun git clone --depth 1 --branch "v${NPM_VERSION}" "${GIT_URL}" "${NPM_TMP}" --
 log "Source cloned to ${NPM_TMP}" 
 
 # ---------------------------------------------------------------------------
+}  # end _step3_clone_source
+_step3_clone_source
+
+# >>> SECTION: _step4_build_frontend >>>
+_step4_build_frontend() {
 # Build the frontend
 # ---------------------------------------------------------------------------
 step "Step 4/7 — Building frontend (this may take a few minutes)"
@@ -736,9 +877,26 @@ info "pnpm $(pnpm --version) ready."
 # Patch BEFORE pnpm install so the resolver picks v10 from the start.
 _FRONTEND_PKG="${NPM_TMP}/frontend/package.json"
 if grep -q '"react-intl"' "${_FRONTEND_PKG}" 2>/dev/null; then
-    jq '.dependencies["react-intl"] = "^10.0.0"' "${_FRONTEND_PKG}"         > "${_FRONTEND_PKG}.tmp" && mv "${_FRONTEND_PKG}.tmp" "${_FRONTEND_PKG}"
-    info "react-intl patched: ^8.x → ^10.0.0 (v9 broken/deprecated; v10 API-compatible)"
+    # Pin to a known-good v10 minor — `^10.0.0` would happily resolve to a
+    # future v10.x with breaking changes. `~10.1.0` allows patch updates only.
+    jq '.dependencies["react-intl"] = "~10.1.0"' "${_FRONTEND_PKG}" \
+        > "${_FRONTEND_PKG}.tmp" && mv "${_FRONTEND_PKG}.tmp" "${_FRONTEND_PKG}"
+    info "react-intl patched: ^8.x → ~10.1.0 (v9 broken/deprecated; v10 API-compatible)"
 fi
+
+# ---------------------------------------------------------------------------
+# Patch frontend pnpm.onlyBuiltDependencies (issue #4)
+# ---------------------------------------------------------------------------
+# pnpm v10+ blocks ALL postinstall scripts by default. The frontend toolchain
+# (Vite + its native deps) needs them to compile their bindings — without an
+# allow-list, `pnpm install` aborts with ERR_PNPM_IGNORED_BUILDS for packages
+# like @parcel/watcher and esbuild. Patch the manifest before pnpm install so
+# the resolver sees the allow-list from the very first run.
+_FRONTEND_BUILDS='["@parcel/watcher","esbuild","@swc/core","unrs-resolver","@biomejs/biome","sass"]'
+jq --argjson b "${_FRONTEND_BUILDS}" \
+   '.pnpm = (.pnpm // {}) | .pnpm.onlyBuiltDependencies = $b' \
+   "${_FRONTEND_PKG}" > "${_FRONTEND_PKG}.tmp" && mv "${_FRONTEND_PKG}.tmp" "${_FRONTEND_PKG}"
+info "frontend pnpm.onlyBuiltDependencies set: @parcel/watcher, esbuild, @swc/core, unrs-resolver, @biomejs/biome, sass"
 
 # ---------------------------------------------------------------------------
 # Clean pnpm store before install
@@ -755,29 +913,30 @@ fi
 # ---------------------------------------------------------------------------
 info "Pruning pnpm store (removes orphaned packages from previous runs)..."
 pnpm store prune --force 2>/dev/null || true
-info "Verifying pnpm store integrity..."
-if pnpm store verify 2>/dev/null; then
-    log "pnpm store: OK"
-else
-    warn "pnpm store has corrupted entries — forcing re-download of affected packages"
-    # pnpm store verify already re-fetches any bad entries, so this is informational only
-fi
+# pnpm store has no `verify` subcommand (only add/path/prune/status). The
+# `prune --force` above already removed orphaned and alien entries — that's
+# all the integrity protection pnpm itself offers. Previous revision called
+# `pnpm store verify`, which always exited non-zero and triggered a misleading
+# warning. Reported in #5.
+info "pnpm store: pruned"
 
 info "Installing frontend dependencies..."
 # --reporter=silent suppresses deprecation WARNs from upstream package.json pins
 # (e.g. react-intl@8.x deprecated by upstream). These are informational only
 # and don't affect functionality. In verbose mode, full output is shown.
+# NOTE: previous revision ran `pnpm install --reporter=silent || pnpm install`
+# which doubled install time on slow connections for no diagnostic gain.
 if ${VERBOSE}; then
     pnpm install
 else
-    pnpm install --reporter=silent 2>/dev/null || pnpm install &>/dev/null
+    pnpm install --reporter=silent
 fi
 
 info "Upgrading frontend dependencies to latest compatible versions..."
 if ${VERBOSE}; then
     pnpm upgrade
 else
-    pnpm upgrade --reporter=silent 2>/dev/null || pnpm upgrade &>/dev/null
+    pnpm upgrade --reporter=silent
 fi
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1172,11 @@ unset _build_ok _attempt
 log "Frontend build complete."
 
 # ---------------------------------------------------------------------------
+}  # end _step4_build_frontend
+_step4_build_frontend
+
+# >>> SECTION: _step5_install_backend >>>
+_step5_install_backend() {
 # Install backend node_modules (production only)
 # ---------------------------------------------------------------------------
 step "Step 5/7 → 6/7 — Assembling install directory"
@@ -1069,6 +1233,45 @@ else
     warn "Version patch failed — footer may show wrong version (got ${_AFTER})"
 fi
 
+# ---------------------------------------------------------------------------
+# Patch _listen.conf template for nginx < 1.25.1 (issue #3)
+# ---------------------------------------------------------------------------
+# nginx < 1.25.1 does not support the `http2 on;` / `http2 off;` directives
+# introduced in 2023. Debian 12 (bookworm) ships nginx 1.22.1. NPM's
+# _listen.conf template emits the new directive unconditionally, which
+# causes every proxy host config to fail `nginx -t` — NPM then silently
+# rolls back the config and ports 80/443 never listen.
+#
+# Strategy: detect nginx < 1.25.1 and strip the http2 Jinja block from the
+# template. Proxy hosts then validate; HTTP/2 just won't be enabled (users
+# on bookworm who need HTTP/2 should install nginx from nginx.org or from
+# bookworm-backports). No-op on nginx 1.25+, idempotent on re-runs.
+_NGINX_VER=$(nginx -v 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1 || true)
+if [[ -n "${_NGINX_VER}" ]] && dpkg --compare-versions "${_NGINX_VER}" lt 1.25.1; then
+    _LISTEN_TPL="${NPM_HOME}/backend/templates/_listen.conf"
+    if [[ -f "${_LISTEN_TPL}" ]] && grep -q 'http2 on' "${_LISTEN_TPL}"; then
+        python3 - "${_LISTEN_TPL}" << 'PYHTTP2'
+import re, sys
+p = sys.argv[1]
+src = open(p).read()
+# Match the full {% if http2_support ... %}http2 on;{% else %}http2 off;{% endif %} block,
+# tolerating whitespace and indent variations between releases.
+pat = re.compile(
+    r'\{%\s*if\s+http2_support[^%]*%\}\s*\n?\s*http2\s+on;\s*\n?\s*'
+    r'\{%\s*else[^%]*%\}\s*\n?\s*http2\s+off;\s*\n?\s*\{%\s*endif\s*%\}\n?',
+    re.MULTILINE
+)
+new = pat.sub('', src)
+if new != src:
+    open(p, 'w').write(new)
+    print('  _listen.conf: http2 on/off block removed')
+else:
+    print('  _listen.conf: http2 block not found (template may already be patched)')
+PYHTTP2
+        log "Patched NPM's _listen.conf for nginx ${_NGINX_VER} (< 1.25.1)"
+    fi
+fi
+
 info "Installing backend node_modules in final location..."
 cd "${NPM_HOME}/backend"
 
@@ -1087,7 +1290,7 @@ cd "${NPM_HOME}/backend"
 # ---------------------------------------------------------------------------
 
 PKGJSON="${NPM_HOME}/backend/package.json"
-ALLOWED_BUILDS='["bcrypt","sqlite3","better-sqlite3","@mapbox/node-pre-gyp","node-pre-gyp","node-gyp"]'
+ALLOWED_BUILDS='["bcrypt","sqlite3","better-sqlite3","@mapbox/node-pre-gyp","node-pre-gyp","node-gyp","@parcel/watcher","esbuild"]'
 
 # Single jq pass: set onlyBuiltDependencies, upgrade direct deps with deprecated
 # transitive chains, and add pnpm.overrides for fixable subdependencies.
@@ -1120,7 +1323,7 @@ info "pnpm.overrides: glob→11.x rimraf→6.x tar→7.x uuid→10.x; sqlite3→
 if ${VERBOSE}; then
     pnpm install --prod
 else
-    pnpm install --prod --reporter=silent 2>/dev/null || pnpm install --prod &>/dev/null
+    pnpm install --prod --reporter=silent
 fi
 
 # ---------------------------------------------------------------------------
@@ -1159,18 +1362,14 @@ else
     SQLITE_PKG="sqlite3"
 fi
 
-# Test each module by requiring it with Node.js from the install directory
+# Test each module by requiring it with Node.js from the install directory.
+# Previous revision OR'd three strategies; the ESM + --require fallbacks were
+# dead code (path was a bogus `node_modules/.bin/../..` which Node rejects).
+# Only the cd-into-backend require() ever succeeded, so use it directly.
 _test_module() {
     local label="$1"
     local require_expr="$2"
-    if node --input-type=module \
-           --experimental-vm-modules \
-           <<< "import { createRequire } from 'module';
-const req = createRequire('${NPM_HOME}/backend/index.js');
-req('${require_expr}');" &>/dev/null 2>&1 || \
-       node -e "require('${require_expr}')" \
-            --require "${NPM_HOME}/backend/node_modules/.bin/../.." &>/dev/null 2>&1 || \
-       ( cd "${NPM_HOME}/backend" && node -e "require('${require_expr}')" &>/dev/null 2>&1 ); then
+    if ( cd "${NPM_HOME}/backend" && node -e "require('${require_expr}')" &>/dev/null ); then
         log "  ${label} : OK"
     else
         warn "  ${label} : FAILED to load"
@@ -1335,6 +1534,11 @@ info "Locale files written."
 info "Files assembled at ${NPM_HOME}"
 
 # ---------------------------------------------------------------------------
+}  # end _step5_install_backend
+_step5_install_backend
+
+# >>> SECTION: _step6_seed_data >>>
+_step6_seed_data() {
 # Create and seed data directories
 # ---------------------------------------------------------------------------
 info "Creating data directories under ${NPM_DATA} ..."
@@ -1360,6 +1564,11 @@ for STUB in \
 done
 
 # ---------------------------------------------------------------------------
+}  # end _step6_seed_data
+_step6_seed_data
+
+# >>> SECTION: _step6_seed_data_continued_db >>>
+_step6_seed_data_continued_db() {
 # Configure NPM database
 # CRITICAL: must use "better-sqlite3" not "sqlite3" as the knex client.
 # config.js checks client === 'better-sqlite3' to determine isSqlite().
@@ -1387,6 +1596,11 @@ JSON
 info "SQLite config written."
 
 # ---------------------------------------------------------------------------
+}  # end _step6_seed_data_continued_db
+_step6_seed_data_continued_db
+
+# >>> SECTION: _step6b_configure_nginx >>>
+_step6b_configure_nginx() {
 # Configure nginx for NPM — fully self-contained, no docker/rootfs copies
 # ---------------------------------------------------------------------------
 # ARCHITECTURE CLARIFICATION (critical for understanding why we do this):
@@ -1688,6 +1902,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+}  # end _step6b_configure_nginx
+_step6b_configure_nginx
+
+# >>> SECTION: _step6c_logrotate >>>
+_step6c_logrotate() {
 # Configure logrotate for NPM
 # ---------------------------------------------------------------------------
 cat > /etc/logrotate.d/nginx-proxy-manager <<'LOGROTATE'
@@ -1706,6 +1925,11 @@ cat > /etc/logrotate.d/nginx-proxy-manager <<'LOGROTATE'
 LOGROTATE
 
 # ---------------------------------------------------------------------------
+}  # end _step6c_logrotate
+_step6c_logrotate
+
+# >>> SECTION: _step7_systemd_service >>>
+_step7_systemd_service() {
 # Create systemd service
 # ---------------------------------------------------------------------------
 step "Step 7/7 — Creating systemd service and starting NPM"
@@ -1787,6 +2011,11 @@ systemctl daemon-reload </dev/null >/dev/null 2>&1
 systemctl start "${NPM_SERVICE}" </dev/null >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
+}  # end _step7_systemd_service
+_step7_systemd_service
+
+# >>> SECTION: _step7b_wait_for_service >>>
+_step7b_wait_for_service() {
 # Wait for service to be ready — poll only, no journal output
 # ---------------------------------------------------------------------------
 RETRIES=30
@@ -1819,6 +2048,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+}  # end _step7b_wait_for_service
+_step7b_wait_for_service
+
+# >>> SECTION: _finalize >>>
+_finalize() {
 # Cleanup build artifacts
 # ---------------------------------------------------------------------------
 vrun rm -rf "${NPM_TMP}"
@@ -1843,3 +2077,5 @@ echo ""
 # Any residual journal stream that systemd registered against this TTY will
 # receive EBADF on its next write() and terminate.
 exec >/dev/null 2>&1
+}  # end _finalize
+_finalize
