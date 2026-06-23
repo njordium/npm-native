@@ -1,28 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.8 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.15 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.1.8 — community feedback pass (issues #3, #4, #5):
-#    • #5: removed dead `pnpm store verify` block (subcommand doesn't exist).
-#    • #4: patch frontend package.json with pnpm.onlyBuiltDependencies for
-#          @parcel/watcher / esbuild / @swc/core — fixes ERR_PNPM_IGNORED_BUILDS
-#          on Ubuntu 25.10 and any pnpm v10+ install. Backend list extended too.
-#    • #3: detect nginx < 1.25.1 and strip http2 on/off from NPM's
-#          _listen.conf template so proxy host configs validate. Bookworm
-#          users now see an explanatory warn line at preflight.
-#
-#  v1.1.7 — refactor pass:
-#    • Fixed sqlite-driver detection loop (loop-fallback was unreachable).
-#    • Fixed dead bcrypt-version ternary.
-#    • Simplified _test_module to the only branch that actually worked.
-#    • Guarded arithmetic on potentially-empty MemoryCurrent value.
-#    • Preserved failed build log to /var/log/npm-build-failed.log.
-#    • Stopped retrying pnpm install twice on first failure.
-#    • Pinned react-intl override to a known-good v10 minor.
-#    • Added ERR trap for line/command diagnostics on unexpected failure.
-#    • Sectioned the script into named functions; flow lives in main().
+#  v1.1.15 — pnpm v11 overrides + verify expansion:
+#    - Move pnpm.overrides into pnpm-workspace.yaml. pnpm v11 ignored the
+#      package.json `pnpm` field, so glob/rimraf/tar/uuid pins were not
+#      being applied (deprecated subdeps like prebuild-install still
+#      pulled in). Stop writing the legacy .pnpm.* keys to package.json
+#      entirely; ends the "no longer read by pnpm" warning loop in the
+#      install output. Keep only the non-pnpm-config jq writes (.version,
+#      .dependencies.sqlite3, .dependencies.knex).
+#    - Verify mode adds two sections: Environment (disk free per mount,
+#      time sync active, db integrity, db contents) and External
+#      (Let'\''s Encrypt API reachable, per-domain cert expiry days).
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -36,7 +28,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.8"           # installer script version
+SCRIPT_VERSION="1.1.15"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -104,15 +96,78 @@ RED='\033[0;31m';   GREEN='\033[0;32m';  YELLOW='\033[1;33m'
 CYAN='\033[0;36m';  BLUE='\033[0;34m';   MAGENTA='\033[0;35m'
 BOLD='\033[1m';     DIM='\033[2m';        NC='\033[0m'
 
+# ---------------------------------------------------------------------------
+# UTF-8 / ASCII glyph selection (v1.1.12)
+# ---------------------------------------------------------------------------
+# Some operators run this script over an SSH session whose remote LANG is
+# C or POSIX, or in an LXC / serial console without UTF-8 font support.
+# In those terminals Unicode bytes render as `?` and the dashboards are
+# unreadable. Two-step fix:
+#   1. If a UTF-8 locale is installed, switch LC_ALL to it.
+#   2. Detect whether the active locale claims UTF-8 — if not, use ASCII
+#      fallbacks for every decorative glyph.
+# Override the auto-detection with NPM_USE_UTF8=true|false.
+NPM_USE_UTF8="${NPM_USE_UTF8:-auto}"
+if [[ "${NPM_USE_UTF8}" == "auto" ]]; then
+    # Detect (don't force). If the operator's environment is POSIX/C the
+    # terminal almost certainly can't render Unicode either — switching the
+    # locale would still leave question marks. Default to ASCII unless the
+    # active locale explicitly says UTF-8. Override with NPM_USE_UTF8=true.
+    case "${LC_ALL:-${LANG:-}}" in
+        *.UTF-8|*.utf-8|*.UTF8|*.utf8) NPM_USE_UTF8=true ;;
+        *) NPM_USE_UTF8=false ;;
+    esac
+fi
+
+if ${NPM_USE_UTF8}; then
+    G_DASH="\xe2\x80\x94"  ; G_DOT="\xc2\xb7"      ; G_BULLET="\xe2\x80\xa2"
+    G_OK_DOT="\xe2\x97\x8f" ; G_NF_DOT="\xe2\x97\x8b"
+    G_ARROW="\xe2\x86\x92"  ; G_STEP="\xc2\xbb"     ; G_ARROW_HEAVY="\xe2\x9e\x9c"
+    G_CHECK="\xe2\x9c\x93"  ; G_CROSS="\xe2\x9c\x97" ; G_WARN_SYM="\xe2\x9a\xa0"
+    G_HBAR="\xe2\x94\x80"   ; G_HBAR2="\xe2\x95\x90" ; G_HBAR_HEAVY="\xe2\x94\x81"
+    G_VBAR1="\xe2\x94\x82"  ; G_VBAR2="\xe2\x95\x91"
+    G_TL1="\xe2\x94\x8c"    ; G_TR1="\xe2\x94\x90"
+    G_BL1="\xe2\x94\x94"    ; G_BR1="\xe2\x94\x98"
+    G_TL2="\xe2\x95\x94"    ; G_TR2="\xe2\x95\x97"
+    G_BL2="\xe2\x95\x9a"    ; G_BR2="\xe2\x95\x9d"
+    G_SPIN_CHARS='\xe2\xa0\x8b\xe2\xa0\x99\xe2\xa0\xb9\xe2\xa0\xb8\xe2\xa0\xbc\xe2\xa0\xb4\xe2\xa0\xa6\xe2\xa0\xa7\xe2\xa0\x87\xe2\xa0\x8f'
+    # Re-interpret the backslash escapes
+    G_DASH=$(printf '%b' "${G_DASH}")             ; G_DOT=$(printf '%b' "${G_DOT}")
+    G_BULLET=$(printf '%b' "${G_BULLET}")
+    G_OK_DOT=$(printf '%b' "${G_OK_DOT}")          ; G_NF_DOT=$(printf '%b' "${G_NF_DOT}")
+    G_ARROW=$(printf '%b' "${G_ARROW}")            ; G_STEP=$(printf '%b' "${G_STEP}")
+    G_ARROW_HEAVY=$(printf '%b' "${G_ARROW_HEAVY}")
+    G_CHECK=$(printf '%b' "${G_CHECK}")            ; G_CROSS=$(printf '%b' "${G_CROSS}")
+    G_WARN_SYM=$(printf '%b' "${G_WARN_SYM}")
+    G_HBAR=$(printf '%b' "${G_HBAR}")              ; G_HBAR2=$(printf '%b' "${G_HBAR2}")
+    G_HBAR_HEAVY=$(printf '%b' "${G_HBAR_HEAVY}")
+    G_VBAR1=$(printf '%b' "${G_VBAR1}")            ; G_VBAR2=$(printf '%b' "${G_VBAR2}")
+    G_TL1=$(printf '%b' "${G_TL1}")                ; G_TR1=$(printf '%b' "${G_TR1}")
+    G_BL1=$(printf '%b' "${G_BL1}")                ; G_BR1=$(printf '%b' "${G_BR1}")
+    G_TL2=$(printf '%b' "${G_TL2}")                ; G_TR2=$(printf '%b' "${G_TR2}")
+    G_BL2=$(printf '%b' "${G_BL2}")                ; G_BR2=$(printf '%b' "${G_BR2}")
+    G_SPIN_CHARS=$(printf '%b' "${G_SPIN_CHARS}")
+else
+    G_DASH="-"     ; G_DOT="|"     ; G_BULLET="*"
+    G_OK_DOT="*"   ; G_NF_DOT="o"
+    G_ARROW="->"   ; G_STEP=">"    ; G_ARROW_HEAVY=">"
+    G_CHECK="OK"   ; G_CROSS="X"   ; G_WARN_SYM="!"
+    G_HBAR="-"     ; G_HBAR2="="   ; G_HBAR_HEAVY="="
+    G_VBAR1="|"    ; G_VBAR2="|"
+    G_TL1="+"      ; G_TR1="+"     ; G_BL1="+"   ; G_BR1="+"
+    G_TL2="+"      ; G_TR2="+"     ; G_BL2="+"   ; G_BR2="+"
+    G_SPIN_CHARS='|/-\'
+fi
+
 TS()     { date '+%Y-%m-%d %H:%M:%S'; }
-log()    { echo -e "${GREEN}[✓]${NC} $(TS) $*"; }
+log()    { echo -e "${GREEN}[${G_CHECK}]${NC} $(TS) $*"; }
 warn()   { echo -e "${YELLOW}[!]${NC} $(TS) $*"; }
-die()    { echo -e "\n${RED}[✗] FATAL:${NC} $(TS) $*\n" >&2; exit 1; }
-banner() { echo -e "\n${BOLD}${CYAN}━━━  $*  ━━━${NC}\n"; }
+die()    { echo -e "\n${RED}[${G_CROSS}] FATAL:${NC} $(TS) $*\n" >&2; exit 1; }
+banner() { echo -e "\n${BOLD}${CYAN}${G_HBAR_HEAVY}${G_HBAR_HEAVY}${G_HBAR_HEAVY}  $*  ${G_HBAR_HEAVY}${G_HBAR_HEAVY}${G_HBAR_HEAVY}${NC}\n"; }
 # info(): visible only in verbose mode
-info()   { ${VERBOSE} && echo -e "${CYAN}[→]${NC} $(TS) $*" || true; }
+info()   { ${VERBOSE} && echo -e "${CYAN}[${G_ARROW}]${NC} $(TS) $*" || true; }
 # step(): always visible — shows top-level progress
-step()   { echo -e "${BOLD}${CYAN}[»]${NC} $(TS) ${BOLD}$*${NC}"; }
+step()   { echo -e "${BOLD}${CYAN}[${G_STEP}]${NC} $(TS) ${BOLD}$*${NC}"; }
 # vrun(): run a command, suppressing output unless verbose
 vrun()   { if ${VERBOSE}; then "$@"; else "$@" &>/dev/null; fi; }
 # _infoline(): print one info line in the existing-install summary.
@@ -122,6 +177,35 @@ _infoline() {
     # _infoline <status_color> <bullet> <label> <value>
     local _col="$1" _bul="$2" _lbl="$3" _val="$4"
     printf "  %b%s%b  %-10s  %s\n" "${_col}" "${_bul}" "${NC}" "${_lbl}" "${_val}"
+}
+
+# _pnpm_install_with_retry: wrap pnpm install/upgrade calls with exponential
+# backoff retry. A single metadata fetch timeout (e.g. ERR_PNPM_META_FETCH_FAIL)
+# on registry.npmjs.org no longer kills the install. 3 attempts, 15s/30s/60s
+# backoff. The wrapped command's real exit code is surfaced on final failure.
+# NOTE: uses the `cmd || _rc=$?` idiom because `if cmd; then; fi` consumes the
+# failing exit code (bash sets $? to 0 after a not-taken if-then branch).
+_pnpm_install_with_retry() {
+    local _attempts=3
+    local _backoff=15
+    local _attempt _rc
+    for _attempt in $(seq 1 ${_attempts}); do
+        _rc=0
+        "$@" || _rc=$?
+        if [[ ${_rc} -eq 0 ]]; then
+            [[ ${_attempt} -gt 1 ]] && log "pnpm install succeeded on retry attempt ${_attempt}"
+            return 0
+        fi
+        if [[ ${_attempt} -lt ${_attempts} ]]; then
+            warn "pnpm install failed (attempt ${_attempt}/${_attempts}, rc=${_rc}). Retrying in ${_backoff}s..."
+            sleep ${_backoff}
+            _backoff=$(( _backoff * 2 ))
+        else
+            warn "pnpm install exhausted ${_attempts} attempts (rc=${_rc}). Last error above."
+            warn "If this persists: check /etc/resolv.conf, try a different registry via npm_config_registry, or re-run with --verbose for full output."
+            return ${_rc}
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -180,8 +264,8 @@ cat << 'SPLASH'
 SPLASH
 printf "${CYAN}       /___/                            /____/  v%s${NC}\n" "${SCRIPT_VERSION}"
 echo -e "${NC}"
-echo -e "  ${BOLD}${GREEN}Nginx Proxy Manager${NC}${BOLD} — Native Linux Installer${NC}"
-echo -e "  ${DIM}No Docker · SQLite · Systemd · Team Njordium${NC}"
+echo -e "  ${BOLD}${GREEN}Nginx Proxy Manager${NC}${BOLD} ${G_DASH} Native Linux Installer${NC}"
+echo -e "  ${DIM}No Docker ${G_DOT} SQLite ${G_DOT} Systemd ${G_DOT} Team Njordium${NC}"
 echo -e "  ${DIM}---------------------------------------------${NC}"
 echo ""
 _TOTAL_RAM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo "0")
@@ -203,7 +287,7 @@ if [[ "${_TOTAL_RAM_MB}" -gt 0 && "${_TOTAL_RAM_MB}" -lt 2048 ]]; then
         [[ "${_RAM_CONFIRM,,}" == "y" || "${_RAM_CONFIRM,,}" == "yes" ]] || { echo ""; echo "  Aborted."; exit 1; }
         echo ""
     else
-        warn "Low RAM detected (${_TOTAL_RAM_MB} MB) — build may fail. Use --verbose for details."
+        warn "Low RAM detected (${_TOTAL_RAM_MB} MB) ${G_DASH} build may fail. Use --verbose for details."
     fi
 fi
 
@@ -235,7 +319,7 @@ fi
 # Step 6 to remove the block. Warn the user up front so the change isn't a
 # surprise. Reported in #3.
 if [[ "${_OS_CODENAME}" == "bookworm" ]]; then
-    warn "Debian 12 (bookworm) ships nginx 1.22.1 — installer will patch NPM's _listen.conf to remove the unsupported http2 on/off directive (HTTP/2 toggle in the UI will be inert)."
+    warn "Debian 12 (bookworm) ships nginx 1.22.1 ${G_DASH} installer will patch NPM's _listen.conf to remove the unsupported http2 on/off directive (HTTP/2 toggle in the UI will be inert)."
 fi
 
 # ---------------------------------------------------------------------------
@@ -261,31 +345,31 @@ if [[ -z "${INSTALL_MODE}" ]]; then
         echo -e "  ${BOLD}${YELLOW}Existing Nginx Proxy Manager installation detected${NC}"
         echo ""
         if ${_HAS_SERVICE}; then
-            _infoline "${GREEN}" "●" "Service"  "running"
+            _infoline "${GREEN}" "${G_OK_DOT}" "Service"  "running"
         else
-            _infoline "${RED}"   "●" "Service"  "stopped"
+            _infoline "${RED}"   "${G_OK_DOT}" "Service"  "stopped"
         fi
-        _infoline "${CYAN}" "●" "Home dir" "${NPM_HOME}"
+        _infoline "${CYAN}" "${G_OK_DOT}" "Home dir" "${NPM_HOME}"
         if ${_HAS_DB}; then
             DB_SIZE=$(du -sh "${NPM_DATA}/database.sqlite" 2>/dev/null | cut -f1)
-            _infoline "${CYAN}" "●" "Database" "${NPM_DATA}/database.sqlite (${DB_SIZE})"
+            _infoline "${CYAN}" "${G_OK_DOT}" "Database" "${NPM_DATA}/database.sqlite (${DB_SIZE})"
         else
-            _infoline "${DIM}"  "○" "Database" "not found"
+            _infoline "${DIM}"  "${G_NF_DOT}" "Database" "not found"
         fi
         echo ""   
         echo ""
         echo -e "  ${BOLD}Select an option:${NC}"
         echo ""
-        echo -e "  ${BOLD}${RED}1)${NC} ${BOLD}Fresh install${NC}  — Full reinstall, ${RED}wipes database${NC} (clean slate)"
-        echo -e "  ${BOLD}${YELLOW}2)${NC} ${BOLD}Update/reinstall${NC} — Reinstall NPM, ${GREEN}database preserved${NC}"
-        echo -e "  ${BOLD}${GREEN}3)${NC} ${BOLD}Verify install${NC}  — Run health checks on the current installation"
+        echo -e "  ${BOLD}${RED}1)${NC} ${BOLD}Fresh install${NC}  ${G_DASH} Full reinstall, ${RED}wipes database${NC} (clean slate)"
+        echo -e "  ${BOLD}${YELLOW}2)${NC} ${BOLD}Update/reinstall${NC} ${G_DASH} Reinstall NPM, ${GREEN}database preserved${NC}"
+        echo -e "  ${BOLD}${GREEN}3)${NC} ${BOLD}Verify install${NC}  ${G_DASH} Run health checks on the current installation"
         echo -e "  ${BOLD}${DIM}q)${NC} ${DIM}Quit${NC}"
         echo ""
         if [[ -t 0 ]]; then
             read -rp "  Choice [1/2/3/q]: " _CHOICE || true
         else
             _CHOICE=""
-            warn "Non-interactive mode with existing install detected — aborting for safety."
+            warn "Non-interactive mode with existing install detected ${G_DASH} aborting for safety."
             warn "Use --fresh, --update, or --verify flags for non-interactive execution."
             exit 1
         fi
@@ -299,7 +383,7 @@ if [[ -z "${INSTALL_MODE}" ]]; then
         esac
     else
         # ── No existing installation ─────────────────────────────────────────
-        echo -e "  ${GREEN}No existing installation found — proceeding with fresh install.${NC}"
+        echo -e "  ${GREEN}No existing installation found ${G_DASH} proceeding with fresh install.${NC}"
         echo ""
         INSTALL_MODE="fresh"
     fi
@@ -321,17 +405,17 @@ if [[ "${INSTALL_MODE}" != "verify" ]]; then
     if [[ -t 0 ]]; then
         echo ""
         echo -e "  ${BOLD}Output verbosity:${NC}"
-        echo -e "  ${BOLD}${GREEN}1)${NC} Quiet ${DIM}(default)${NC}  — Show main steps only"
-        echo -e "  ${BOLD}${CYAN}2)${NC} Verbose          — Show all output from every step"
+        echo -e "  ${BOLD}${GREEN}1)${NC} Quiet ${DIM}(default)${NC}  ${G_DASH} Show main steps only"
+        echo -e "  ${BOLD}${CYAN}2)${NC} Verbose          ${G_DASH} Show all output from every step"
         echo ""
         read -rp "  Verbosity [1/2, default=1]: " _VERB_CHOICE || true
         case "${_VERB_CHOICE}" in
             2) VERBOSE=true;  echo -e "  ${CYAN}Verbose mode enabled.${NC}" ;;
-            *) VERBOSE=false; echo -e "  ${DIM}Quiet mode — only main steps will be shown.${NC}" ;;
+            *) VERBOSE=false; echo -e "  ${DIM}Quiet mode ${G_DASH} only main steps will be shown.${NC}" ;;
         esac
         echo ""
     else
-        info "Non-interactive mode — using quiet output (pass --verbose to override)."
+        info "Non-interactive mode ${G_DASH} using quiet output (pass --verbose to override)."
     fi
 fi
 
@@ -348,15 +432,15 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     _pok()  { echo -e "  ${GREEN}[PASS]${NC} $*"; (( _PASS += 1 )) || true; }
     _pfail(){ echo -e "  ${RED}[FAIL]${NC} $*"; (( _FAIL += 1 )) || true; }
     _pwarn(){ echo -e "  ${YELLOW}[WARN]${NC} $*"; (( _WARN += 1 )) || true; }
-    _sect() { echo ""; echo -e "${BOLD}── $* ──${NC}"; }
+    _sect() { echo ""; echo -e "${BOLD}${G_HBAR}${G_HBAR} $* ${G_HBAR}${G_HBAR}${NC}"; }
 
     # Cache host IP once for all verify output
     HOST_IP=$(hostname -I | awk '{print $1}')
 
     echo ""
-    echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║   Nginx Proxy Manager — Installation Verification            ║${NC}"
-    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${BOLD}${CYAN}${G_TL2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_TR2}${NC}"
+    echo -e "${BOLD}${CYAN}${G_VBAR2}   Nginx Proxy Manager ${G_DASH} Installation Verification            ${G_VBAR2}${NC}"
+    echo -e "${BOLD}${CYAN}${G_BL2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_BR2}${NC}"
     echo -e "  ${DIM}Host: $(hostname)   IP: ${HOST_IP}   $(date '+%Y-%m-%d %H:%M:%S')${NC}"
 
     # ── Services ─────────────────────────────────────────────────────────────
@@ -376,12 +460,12 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
         echo -e "       ${DIM}since: ${_NPM_UP}${NC}"
     else
         _pfail "nginx-proxy-manager  NOT running"
-        echo  "       → run: systemctl start ${NPM_SERVICE}"
+        echo  "       ${G_ARROW} run: systemctl start ${NPM_SERVICE}"
     fi
     if systemctl is-enabled --quiet "${NPM_SERVICE}" 2>/dev/null; then
         _pok  "nginx-proxy-manager  enabled (auto-starts on reboot)"
     else
-        _pwarn "nginx-proxy-manager  NOT enabled — won't start after reboot"
+        _pwarn "nginx-proxy-manager  NOT enabled ${G_DASH} won't start after reboot"
     fi
     if systemctl is-active --quiet nginx 2>/dev/null; then
         _NGINX_V=$(nginx -v 2>&1 | grep -oP 'nginx/[\d.]+' || echo "nginx")
@@ -392,13 +476,13 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     if systemctl is-enabled --quiet nginx 2>/dev/null; then
         _pok  "nginx                enabled (auto-starts on reboot)"
     else
-        _pwarn "nginx                NOT enabled — won't start after reboot"
-        echo  "       → run: systemctl enable nginx"
+        _pwarn "nginx                NOT enabled ${G_DASH} won't start after reboot"
+        echo  "       ${G_ARROW} run: systemctl enable nginx"
     fi
     if nginx -t &>/dev/null 2>&1; then
         _pok  "nginx config         syntax OK"
     else
-        _pfail "nginx config         FAILED — run: nginx -t"
+        _pfail "nginx config         FAILED ${G_DASH} run: nginx -t"
     fi
 
     # ── Network ──────────────────────────────────────────────────────────────
@@ -411,7 +495,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     if ss -tlnp 2>/dev/null | grep -q ':3000 '; then
         _pok  "backend process      port 3000 bound (Node.js backend listening)"
     else
-        _pfail "backend process      port 3000 NOT bound — Node.js backend not running"
+        _pfail "backend process      port 3000 NOT bound ${G_DASH} Node.js backend not running"
     fi
 
     # API health — try via nginx first, fall back to direct backend check
@@ -424,8 +508,8 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
         _API_DIRECT=$(curl -sf --max-time 4 "http://127.0.0.1:3000/" 2>/dev/null || echo "{}")
         _API_DIRECT_STATUS=$(echo "${_API_DIRECT}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','?'))" 2>/dev/null || echo "ERR")
         if [[ "${_API_DIRECT_STATUS}" == "OK" ]]; then
-            _pwarn "backend API          responding on :3000 directly but NOT via nginx port ${ADMIN_PORT} — nginx is down"
-            echo  "       → run: systemctl start nginx"
+            _pwarn "backend API          responding on :3000 directly but NOT via nginx port ${ADMIN_PORT} ${G_DASH} nginx is down"
+            echo  "       ${G_ARROW} run: systemctl start nginx"
         else
             _pfail "backend API          not responding on port ${ADMIN_PORT} or :3000 directly (nginx down + backend issue)"
         fi
@@ -465,9 +549,9 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     _sect "Setup State"
     _SETUP_RESP=$(curl -sf --max-time 4 "http://127.0.0.1:${ADMIN_PORT}/api/" 2>/dev/null         | python3 -c "import sys,json; d=json.load(sys.stdin); print('setup_done' if d.get('setup') else 'setup_needed')"         2>/dev/null || echo "unknown")
     if [[ "${_SETUP_RESP}" == "setup_done" ]]; then
-        _pok  "admin account        created — setup wizard complete"
+        _pok  "admin account        created ${G_DASH} setup wizard complete"
     elif [[ "${_SETUP_RESP}" == "setup_needed" ]]; then
-        _pwarn "admin account        NOT created yet — visit http://${HOST_IP}:${ADMIN_PORT}/ to set up"
+        _pwarn "admin account        NOT created yet ${G_DASH} visit http://${HOST_IP}:${ADMIN_PORT}/ to set up"
     else
         _pwarn "admin account        could not determine setup state"
     fi
@@ -475,9 +559,9 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     # ── File system ──────────────────────────────────────────────────────────
     _sect "File System"
     [[ -f "${NPM_HOME}/backend/index.js" ]]         && _pok  "backend              ${NPM_HOME}/backend/index.js"         || _pfail "backend              index.js MISSING at ${NPM_HOME}/backend/"
-    [[ -f "${NPM_HOME}/frontend/index.html" ]]         && _pok  "frontend             ${NPM_HOME}/frontend/index.html"         || _pfail "frontend             index.html MISSING — UI will not load"
+    [[ -f "${NPM_HOME}/frontend/index.html" ]]         && _pok  "frontend             ${NPM_HOME}/frontend/index.html"         || _pfail "frontend             index.html MISSING ${G_DASH} UI will not load"
     [[ -d "${NPM_HOME}/frontend/lang" ]]         && { _LANG_COUNT=$(ls "${NPM_HOME}/frontend/lang/"*.json 2>/dev/null | wc -l)
-             _pok  "locales              ${NPM_HOME}/frontend/lang/ (${_LANG_COUNT} files)"; }         || _pwarn "locales              lang/ missing — UI may show raw i18n keys"
+             _pok  "locales              ${NPM_HOME}/frontend/lang/ (${_LANG_COUNT} files)"; }         || _pwarn "locales              lang/ missing ${G_DASH} UI may show raw i18n keys"
     if [[ -f "${NPM_DATA}/database.sqlite" ]]; then
         _DB_SIZE=$(du -sh "${NPM_DATA}/database.sqlite" 2>/dev/null | cut -f1)
         _pok  "database             ${NPM_DATA}/database.sqlite (${_DB_SIZE})"
@@ -492,7 +576,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     if ( cd "${NPM_HOME}/backend" && node -e "require('bcrypt')" &>/dev/null ); then
         _pok  "bcrypt               loads OK (password hashing)"
     else
-        _pfail "bcrypt               FAILED to load — backend will crash on login"
+        _pfail "bcrypt               FAILED to load ${G_DASH} backend will crash on login"
     fi
     # SQLite driver detection — the original used `for ... done || _pfail`
     # which never fires when the loop runs to completion. Use an explicit flag.
@@ -513,28 +597,28 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
         _DB_CLIENT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['database']['knex']['client'])" "${_PROD}" 2>/dev/null || echo "?")
         _DB_FILE=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['database']['knex']['connection']['filename'])" "${_PROD}" 2>/dev/null || echo "?")
         if [[ "${_DB_CLIENT}" == "better-sqlite3" ]]; then
-            _pok  "db client            ${_DB_CLIENT} (isSqlite()=true → uses datetime('now'))"
+            _pok  "db client            ${_DB_CLIENT} (isSqlite()=true ${G_ARROW} uses datetime('now'))"
         else
-            _pfail "db client            '${_DB_CLIENT}' — must be 'better-sqlite3' or NOW() errors occur"
+            _pfail "db client            '${_DB_CLIENT}' ${G_DASH} must be 'better-sqlite3' or NOW() errors occur"
         fi
         _pok  "db file              ${_DB_FILE}"
     fi
-    grep -q 'proxy_pass.*127.0.0.1:3000' /etc/nginx/nginx.conf 2>/dev/null         && _pok  "nginx proxy          port ${ADMIN_PORT} → :3000 present"         || _pfail "nginx proxy          port ${ADMIN_PORT} → :3000 missing in nginx.conf"
+    grep -q 'proxy_pass.*127.0.0.1:3000' /etc/nginx/nginx.conf 2>/dev/null         && _pok  "nginx proxy          port ${ADMIN_PORT} ${G_ARROW} :3000 present"         || _pfail "nginx proxy          port ${ADMIN_PORT} ${G_ARROW} :3000 missing in nginx.conf"
 
     # Certbot virtualenv — required for DNS challenge certificate requests
     if [[ -f "/opt/certbot/bin/activate" ]]; then
         _CB_VER=$(/opt/certbot/bin/certbot --version 2>&1 | grep -oP '[\d.]+' | head -1)
-        _pok  "certbot venv         /opt/certbot (v${_CB_VER}) — DNS plugins will install correctly"
+        _pok  "certbot venv         /opt/certbot (v${_CB_VER}) ${G_DASH} DNS plugins will install correctly"
     else
-        _pfail "certbot venv         /opt/certbot MISSING — DNS challenge cert requests will fail"
-        echo  "       → run: python3 -m venv /opt/certbot && /opt/certbot/bin/pip install certbot"
+        _pfail "certbot venv         /opt/certbot MISSING ${G_DASH} DNS challenge cert requests will fail"
+        echo  "       ${G_ARROW} run: python3 -m venv /opt/certbot && /opt/certbot/bin/pip install certbot"
     fi
 
     # Check Docker rootfs include files — required for proxy host config generation
     _MISS=0
     for _INC in proxy.conf block-exploits.conf force-ssl.conf ssl-ciphers.conf; do
         [[ ! -f "/etc/nginx/conf.d/include/${_INC}" ]] && {
-            _pfail "nginx include /etc/nginx/conf.d/include/${_INC} MISSING — proxy hosts will not write nginx configs"
+            _pfail "nginx include /etc/nginx/conf.d/include/${_INC} MISSING ${G_DASH} proxy hosts will not write nginx configs"
             _MISS=$(( _MISS + 1 ))
         }
     done
@@ -544,28 +628,147 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     if nginx -t &>/dev/null 2>&1; then
         _pok  "nginx -t syntax OK (proxy host config creation will succeed)"
     else
-        _pfail "nginx -t FAILED — proxy host config creation will silently roll back (run: nginx -t)"
+        _pfail "nginx -t FAILED ${G_DASH} proxy host config creation will silently roll back (run: nginx -t)"
+    fi
+
+    # ── Environment ──────────────────────────────────────────────────────────
+    # v1.1.15: catches "disk full / clock skew / db corrupt" issues that
+    # otherwise surface as silent failures days later.
+    _sect "Environment"
+    # Disk free for each path the installer writes to
+    for _path in / /opt "${NPM_DATA}" /var; do
+        [[ -d "${_path}" ]] || continue
+        _free_kb=$(df -k "${_path}" 2>/dev/null | tail -1 | awk '{print $4}')
+        _free_human=$(df -h "${_path}" 2>/dev/null | tail -1 | awk '{print $4}')
+        if   [[ ${_free_kb:-0} -lt 102400 ]]; then  _pfail "disk ${_path}        ${_free_human} free (< 100 MB)"
+        elif [[ ${_free_kb:-0} -lt 1048576 ]]; then _pwarn "disk ${_path}        ${_free_human} free (< 1 GB)"
+        else _pok  "disk ${_path}        ${_free_human} free"
+        fi
+    done
+
+    # Time sync — cert validation breaks with a skewed clock
+    _TIMESYNC_ACTIVE=false
+    for _svc in chronyd systemd-timesyncd ntpd ntp; do
+        if systemctl is-active --quiet "${_svc}" 2>/dev/null; then
+            _pok "time sync           ${_svc} active"
+            _TIMESYNC_ACTIVE=true
+            break
+        fi
+    done
+    ${_TIMESYNC_ACTIVE} || _pwarn "time sync           no chronyd/systemd-timesyncd/ntpd active ${G_DASH} cert validation may fail"
+
+    # Database integrity + row counts (only if DB exists)
+    if [[ -f "${NPM_DATA}/database.sqlite" ]]; then
+        _INTEG=$(sqlite3 "${NPM_DATA}/database.sqlite" "PRAGMA integrity_check" 2>/dev/null | head -1)
+        if [[ "${_INTEG}" == "ok" ]]; then
+            _pok "database integrity  PRAGMA integrity_check = ok"
+        else
+            _pfail "database integrity  ${_INTEG:-PRAGMA failed (DB locked or unreadable)}"
+        fi
+        _N_HOSTS=$(sqlite3 "${NPM_DATA}/database.sqlite" "SELECT COUNT(*) FROM proxy_host WHERE is_deleted=0" 2>/dev/null || echo "?")
+        _N_USERS=$(sqlite3 "${NPM_DATA}/database.sqlite" "SELECT COUNT(*) FROM user WHERE is_deleted=0" 2>/dev/null || echo "?")
+        _N_CERTS=$(sqlite3 "${NPM_DATA}/database.sqlite" "SELECT COUNT(*) FROM certificate WHERE is_deleted=0" 2>/dev/null || echo "?")
+        _pok "db contents         ${_N_HOSTS} proxy hosts, ${_N_USERS} users, ${_N_CERTS} certificates"
+    fi
+
+    # ── External ─────────────────────────────────────────────────────────────
+    # v1.1.15: confirms the host can actually do cert renewal.
+    _sect "External"
+    # Outbound HTTPS to Let'''s Encrypt API
+    if curl -sf --max-time 5 -o /dev/null "https://acme-v02.api.letsencrypt.org/directory" 2>/dev/null; then
+        _pok "Let'''s Encrypt API   reachable (cert renewal should succeed)"
+    else
+        _pwarn "Let'''s Encrypt API   NOT reachable ${G_DASH} check outbound HTTPS / DNS / firewall"
+    fi
+
+    # Per-cert expiry inside /etc/letsencrypt/live/<domain>/cert.pem
+    if [[ -d /etc/letsencrypt/live ]]; then
+        _CERT_FOUND=0
+        while IFS= read -r _cert; do
+            _CERT_FOUND=$(( _CERT_FOUND + 1 ))
+            _domain=$(basename "$(dirname "${_cert}")")
+            _expiry=$(openssl x509 -enddate -noout -in "${_cert}" 2>/dev/null | cut -d= -f2)
+            if [[ -z "${_expiry}" ]]; then
+                _pwarn "cert ${_domain}      could not read expiry (openssl x509 failed)"
+                continue
+            fi
+            _expiry_epoch=$(date -d "${_expiry}" +%s 2>/dev/null || echo 0)
+            _now_epoch=$(date +%s)
+            _days_left=$(( (_expiry_epoch - _now_epoch) / 86400 ))
+            _expiry_human=$(date -d "${_expiry}" '+%Y-%m-%d' 2>/dev/null || echo "${_expiry}")
+            if   [[ ${_days_left} -lt 0 ]];   then _pfail "cert ${_domain}      EXPIRED ${_days_left#-} days ago (${_expiry_human}) ${G_DASH} renew now"
+            elif [[ ${_days_left} -lt 7 ]];   then _pfail "cert ${_domain}      expires in ${_days_left} days (${_expiry_human})"
+            elif [[ ${_days_left} -lt 30 ]];  then _pwarn "cert ${_domain}      expires in ${_days_left} days (${_expiry_human})"
+            else _pok  "cert ${_domain}      ${_days_left} days until expiry (${_expiry_human})"
+            fi
+        done < <(find /etc/letsencrypt/live -name 'cert.pem' 2>/dev/null)
+        if [[ ${_CERT_FOUND} -eq 0 ]]; then
+            _pwarn "Let'''s Encrypt certs no /etc/letsencrypt/live/*/cert.pem found yet ${G_DASH} expected on a fresh install"
+        fi
     fi
 
     # ── Summary ──────────────────────────────────────────────────────────────
     echo ""
-    echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${NC}"
     _TOTAL=$(( _PASS + _FAIL + _WARN ))
     echo -e "  ${GREEN}${_PASS} passed${NC}  ${RED}${_FAIL} failed${NC}  ${YELLOW}${_WARN} warnings${NC}  / ${_TOTAL} total checks"
     echo ""
     if [[ ${_FAIL} -gt 0 ]]; then
-        echo -e "  ${RED}${BOLD}✗  Installation has problems. See FAIL items above.${NC}"
+        echo -e "  ${RED}${BOLD}${G_CROSS}  Installation has problems. See FAIL items above.${NC}"
         echo ""
         exit 1
     elif [[ ${_WARN} -gt 0 ]]; then
-        echo -e "  ${YELLOW}${BOLD}⚠  Installation OK with warnings.${NC}"
+        echo -e "  ${YELLOW}${BOLD}${G_WARN_SYM}  Installation OK with warnings.${NC}"
     else
-        echo -e "  ${GREEN}${BOLD}✓  All checks passed. NPM is healthy and fully operational.${NC}"
+        echo -e "  ${GREEN}${BOLD}${G_CHECK}  All checks passed. NPM is healthy and fully operational.${NC}"
     fi
     echo ""
     echo -e "  ${CYAN}Admin Panel :${NC} ${BOLD}http://${HOST_IP}:${ADMIN_PORT}${NC}"
     echo -e "  ${CYAN}Version     :${NC} ${_VER_CURRENT}"
     echo ""
+
+    # v1.1.11 (#5): offer a diagnostic bundle for issue submission.
+    # Bundle = service journal tails, /data/logs/ tails, production.json,
+    # backend package.json, system info. No secrets in any of these on a
+    # default install — but printed prominently so the operator can review.
+    if [[ -t 0 ]]; then
+        read -rp "  Save diagnostic bundle to /var/backups/npm-diag-<ts>.tar.gz? [Y/n]: " _DIAG_CONFIRM || true
+        if [[ ! "${_DIAG_CONFIRM,,}" =~ ^(n|no)$ ]]; then
+            mkdir -p /var/backups 2>/dev/null || true
+            _DIAG_DEST="/var/backups/npm-diag-$(date +%Y%m%d%H%M%S).tar.gz"
+            _DIAG_TMP=$(mktemp -d /tmp/npm-diag.XXXXXX)
+            mkdir -p "${_DIAG_TMP}"/{journal,logs,config}
+            journalctl -u "${NPM_SERVICE}" -n 500 --no-pager 2>/dev/null > "${_DIAG_TMP}/journal/npm-service.log" || true
+            journalctl -u nginx -n 200 --no-pager 2>/dev/null > "${_DIAG_TMP}/journal/nginx.log" || true
+            for _lg in "${NPM_DATA}"/logs/*.log; do
+                [[ -f "${_lg}" ]] && tail -n 1000 "${_lg}" > "${_DIAG_TMP}/logs/$(basename ${_lg})" 2>/dev/null
+            done
+            [[ -f "${NPM_HOME}/backend/config/production.json" ]] && \
+                cp "${NPM_HOME}/backend/config/production.json" "${_DIAG_TMP}/config/production.json"
+            [[ -f "${NPM_HOME}/backend/package.json" ]] && \
+                cp "${NPM_HOME}/backend/package.json" "${_DIAG_TMP}/config/package.json"
+            nginx -T 2>/dev/null > "${_DIAG_TMP}/config/nginx-T.txt" || true
+            {
+                echo "installer-version: ${SCRIPT_VERSION}"
+                echo "npm-version: ${_VER_CURRENT}"
+                echo "node: $(node --version 2>/dev/null || echo not-installed)"
+                echo "pnpm: $(pnpm --version 2>/dev/null || echo not-installed)"
+                echo "nginx: $(nginx -v 2>&1 | head -1)"
+                echo "certbot: $(/opt/certbot/bin/certbot --version 2>&1 | head -1)"
+                echo "kernel: $(uname -a)"
+                echo "os: $(grep PRETTY_NAME /etc/os-release | cut -d= -f2- | tr -d '\"')"
+                echo "ts: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            } > "${_DIAG_TMP}/system-info.txt"
+            if tar -czf "${_DIAG_DEST}" -C "${_DIAG_TMP}" . 2>/dev/null; then
+                log "Diagnostic bundle saved: ${_DIAG_DEST}"
+                info "Review before sharing ${G_DASH} bundle contains journal tails + nginx -T output."
+            else
+                warn "Failed to assemble diagnostic bundle."
+            fi
+            rm -rf "${_DIAG_TMP}"
+        fi
+        echo ""
+    fi
     exit 0
 fi
 # ---------------------------------------------------------------------------
@@ -577,34 +780,239 @@ _prepare_for_install() {
 # Pre-install actions based on mode
 # ---------------------------------------------------------------------------
 if [[ "${INSTALL_MODE}" == "fresh" ]]; then
+    # v1.1.11 (#4): before nuking the DB, look for a previous DB backup.
+    # If found, offer to restore — saves anyone who picked "fresh" by mistake.
+    # Restore switches the flow to update mode so the new code is installed
+    # over the restored database.
+    _NEWEST_BAK=""
+    if compgen -G "${NPM_DATA}/database.sqlite.bak.*" > /dev/null 2>&1; then
+        _NEWEST_BAK=$(ls -1t "${NPM_DATA}"/database.sqlite.bak.* 2>/dev/null | head -1)
+    fi
+    if [[ -n "${_NEWEST_BAK}" && -t 0 ]]; then
+        _BAK_DATE=$(stat -c '%y' "${_NEWEST_BAK}" 2>/dev/null | cut -d. -f1)
+        echo ""
+        info "Previous database backup detected:"
+        info "  ${_NEWEST_BAK}"
+        info "  mtime: ${_BAK_DATE}"
+        read -rp "  Restore this backup instead of a fresh install? [y/N]: " _RESTORE_CONFIRM || true
+        if [[ "${_RESTORE_CONFIRM,,}" == "y" || "${_RESTORE_CONFIRM,,}" == "yes" ]]; then
+            cp "${_NEWEST_BAK}" "${NPM_DATA}/database.sqlite" \
+                && log "Database restored from ${_NEWEST_BAK}" \
+                || die "Restore failed ${G_DASH} refusing to continue"
+            INSTALL_MODE="update"
+            _HAS_DB=true
+            info "Switched to --update flow with the restored database in place."
+        fi
+    fi
+fi
+
+# Re-check INSTALL_MODE in case #4 flipped us from fresh → update
+if [[ "${INSTALL_MODE}" == "fresh" ]]; then
     if ${_HAS_DB}; then
-        echo -e "${RED}┌──────────────────────────────────────────────────────────────┐${NC}"
-        echo -e "${RED}│  WARNING: Fresh install will permanently DELETE the database! │${NC}"
-        echo -e "${RED}│  All proxy hosts, SSL certificates, and users will be lost.  │${NC}"
-        echo -e "${RED}└──────────────────────────────────────────────────────────────┘${NC}"
+        echo -e "${RED}${G_TL1}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_TR1}${NC}"
+        echo -e "${RED}${G_VBAR1}  WARNING: Fresh install will permanently DELETE the database! ${G_VBAR1}${NC}"
+        echo -e "${RED}${G_VBAR1}  All proxy hosts, SSL certificates, and users will be lost.  ${G_VBAR1}${NC}"
+        echo -e "${RED}${G_BL1}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_HBAR}${G_BR1}${NC}"
         echo ""
         read -rp "  Type YES to confirm database wipe: " _DB_CONFIRM || true
-        [[ "${_DB_CONFIRM}" == "YES" ]] || { info "Aborted — database not touched."; exit 0; }
+        [[ "${_DB_CONFIRM}" == "YES" ]] || { info "Aborted ${G_DASH} database not touched."; exit 0; }
     fi
     # Stop and backup
     systemctl stop "${NPM_SERVICE}" 2>/dev/null || true
     if [[ -f "${NPM_DATA}/database.sqlite" ]]; then
         DB_BACKUP="${NPM_DATA}/database.sqlite.bak.$(date +%Y%m%d%H%M%S)"
         cp "${NPM_DATA}/database.sqlite" "${DB_BACKUP}"
-        [[ -f "${DB_BACKUP}" ]] || die "Database backup failed — refusing to delete original"
+        [[ -f "${DB_BACKUP}" ]] || die "Database backup failed ${G_DASH} refusing to delete original"
         warn "Database backed up to: ${DB_BACKUP}"
         rm -f "${NPM_DATA}/database.sqlite"
-        info "Database wiped — starting fresh."
+        info "Database wiped ${G_DASH} starting fresh."
     fi
 elif [[ "${INSTALL_MODE}" == "update" ]]; then
-    systemctl stop "${NPM_SERVICE}" 2>/dev/null || true
+    # v1.1.9: do NOT stop the service here — defer until just before the
+    # install swap in _step5_install_backend. The service stays up through
+    # the frontend build (the longest phase), shrinking total downtime.
     if ${_HAS_DB}; then
         DB_BACKUP="${NPM_DATA}/database.sqlite.bak.$(date +%Y%m%d%H%M%S)"
         cp "${NPM_DATA}/database.sqlite" "${DB_BACKUP}"
-        [[ -f "${DB_BACKUP}" ]] || die "Database backup failed — refusing to proceed"
+        [[ -f "${DB_BACKUP}" ]] || die "Database backup failed ${G_DASH} refusing to proceed"
         log "Database backed up to: ${DB_BACKUP}"
     fi
-    info "Database preserved — update mode."
+    info "Database preserved ${G_DASH} update mode (service still running)."
+
+    # v1.1.10 (#8): warn / prompt on minor or major version jumps.
+    # `--update` auto-resolves "latest" from GitHub; a 2.13.x → 2.16.0
+    # leap could carry schema or template changes the operator should
+    # see before crossing. Read installed version from the package.json
+    # we are about to replace.
+    if [[ -f "${NPM_HOME}/backend/package.json" ]]; then
+        _INSTALLED_VER=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version','?'))" \
+            "${NPM_HOME}/backend/package.json" 2>/dev/null || echo "?")
+        if [[ "${_INSTALLED_VER}" != "?" && "${_INSTALLED_VER}" != "${NPM_VERSION}" ]]; then
+            _IM=$(echo "${_INSTALLED_VER}" | cut -d. -f1-2)
+            _NM=$(echo "${NPM_VERSION}"    | cut -d. -f1-2)
+            # v1.1.11 (#1 + #6): minor/major jump — show release-notes summary,
+            # then offer a three-way menu so the operator can pin/redirect
+            # without re-running the script.
+            while [[ "${_IM}" != "${_NM}" ]]; do
+                echo ""
+                warn "Version jump: installed v${_INSTALLED_VER} ${G_ARROW} resolved v${NPM_VERSION} crosses minor/major."
+                # v1.1.11 (#1): fetch and show the Changes section from the
+                # upstream release notes so the operator decides in-context.
+                _REL_URL="https://github.com/NginxProxyManager/nginx-proxy-manager/releases/tag/v${NPM_VERSION}"
+                _REL_API="https://api.github.com/repos/NginxProxyManager/nginx-proxy-manager/releases/tags/v${NPM_VERSION}"
+                _REL_BODY=$(curl -sf --max-time 8 "${_REL_API}" 2>/dev/null || true)
+                if [[ -n "${_REL_BODY}" ]]; then
+                    echo ""
+                    echo -e "  ${BOLD}${CYAN}${G_HBAR}${G_HBAR} Upstream changelog for v${NPM_VERSION} ${G_HBAR}${G_HBAR}${NC}"
+                    printf '%s' "${_REL_BODY}" | python3 - << 'PYCHANGE'
+import sys, json, re
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+body = data.get("body", "")
+body = re.sub(r'<!--.*?-->', '', body, flags=re.DOTALL)
+body = re.sub(r'!\[.*?\]\(.*?\)', '', body)
+body = re.sub(r'\[!.*?\]', '', body)
+lines = [l.rstrip() for l in body.splitlines()]
+in_changes = False
+out = []
+for l in lines:
+    if l.startswith('## '):
+        in_changes = 'change' in l.lower() or 'highlight' in l.lower() or 'note' in l.lower()
+        if in_changes:
+            out.append(l)
+        elif out:
+            break
+        continue
+    if in_changes and l.strip():
+        out.append(l)
+    if len(out) >= 12:
+        break
+for l in out:
+    print("    " + l)
+if not out:
+    print("    (no Changes section found in release body ${G_DASH} see URL below)")
+PYCHANGE
+                    echo ""
+                    echo -e "  ${DIM}Full notes: ${_REL_URL}${NC}"
+                else
+                    warn "Could not fetch release notes from GitHub. See: ${_REL_URL}"
+                fi
+
+                if [[ ! -t 0 ]]; then
+                    warn "Non-interactive cross-minor update ${G_DASH} proceeding. Use --version <x.y.z> or NPM_VERSION env to pin."
+                    break
+                fi
+
+                echo ""
+                echo -e "  ${BOLD}Version-jump menu:${NC}"
+                echo -e "    ${BOLD}${GREEN}1)${NC} Proceed with resolved v${NPM_VERSION}"
+                echo -e "    ${BOLD}${YELLOW}2)${NC} Abort and pin to currently installed v${_INSTALLED_VER}"
+                echo -e "    ${BOLD}${CYAN}3)${NC} Specify a different version (x.y.z)"
+                echo -e "    ${BOLD}${DIM}q)${NC} Quit without doing anything"
+                echo ""
+                read -rp "  Choice [1/2/3/q]: " _VER_CHOICE || true
+                case "${_VER_CHOICE}" in
+                    1)
+                        info "Proceeding with v${NPM_VERSION}"
+                        break
+                        ;;
+                    2)
+                        info "Aborted. Re-run with --version ${_INSTALLED_VER} to lock the resolver to your installed version."
+                        exit 0
+                        ;;
+                    3)
+                        while true; do
+                            read -rp "    Enter version (x.y.z, e.g. 2.14.5): " _NEW_VER || true
+                            if [[ "${_NEW_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                                NPM_VERSION="${_NEW_VER}"
+                                _NM=$(echo "${NPM_VERSION}" | cut -d. -f1-2)
+                                info "Re-resolved to v${NPM_VERSION}"
+                                break
+                            fi
+                            warn "Invalid version format. Use x.y.z (e.g. 2.14.5)"
+                        done
+                        # Loop continues: if new version is still a jump, prompt again
+                        ;;
+                    q|Q|"")
+                        info "Quit. Nothing was changed."
+                        exit 0
+                        ;;
+                    *)
+                        warn "Invalid choice. Please pick 1, 2, 3, or q."
+                        ;;
+                esac
+            done
+            if [[ "${_IM}" == "${_NM}" ]]; then
+                info "Updating within same minor: v${_INSTALLED_VER} ${G_ARROW} v${NPM_VERSION}"
+            fi
+        fi
+    fi
+
+    # v1.1.11 (#3): scan for prior backups across all locations the installer
+    # writes to. Show total size and the oldest entry, then offer to prune
+    # backups older than 30 days BEFORE we add another round of them.
+    _BAK_PATTERNS=(
+        "${NPM_HOME}".bak-*
+        "${NPM_DATA}"/database.sqlite.bak.*
+        /etc/letsencrypt.bak-*
+        /var/backups/etc-nginx.bak-*.tar.gz
+        /etc/systemd/system/"${NPM_SERVICE}".service.bak-*
+    )
+    _FOUND_BAKS=()
+    for _p in "${_BAK_PATTERNS[@]}"; do
+        if compgen -G "${_p}" > /dev/null 2>&1; then
+            while IFS= read -r _m; do _FOUND_BAKS+=("${_m}"); done < <(compgen -G "${_p}")
+        fi
+    done
+    if [[ ${#_FOUND_BAKS[@]} -gt 0 ]]; then
+        _TOTAL_BYTES=$(du -bsc "${_FOUND_BAKS[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
+        _TOTAL_HUMAN=$(echo "${_TOTAL_BYTES}" | awk '{ s=$1; for(u="";s>=1024 && length(u)<3;u=substr("KMG",length(u)+1,1))s/=1024; printf("%.1f %sB", s, u) }')
+        _OLDER_30=$(find "${_FOUND_BAKS[@]}" -maxdepth 0 -mtime +30 2>/dev/null | wc -l)
+        _OLDEST=$(find "${_FOUND_BAKS[@]}" -maxdepth 0 -printf '%T@ %p
+' 2>/dev/null | sort -n | head -1 | awk '{print $2}')
+        _OLDEST_DATE=$(stat -c '%y' "${_OLDEST}" 2>/dev/null | cut -d' ' -f1)
+        echo ""
+        info "Existing backup inventory:"
+        info "  count: ${#_FOUND_BAKS[@]}   total size: ${_TOTAL_HUMAN}   oldest: ${_OLDEST_DATE}"
+        info "  candidates older than 30 days: ${_OLDER_30}"
+        if [[ "${_OLDER_30}" -gt 0 && -t 0 ]]; then
+            read -rp "  Prune ${_OLDER_30} backup(s) older than 30 days now? [y/N]: " _PRUNE_CONFIRM || true
+            if [[ "${_PRUNE_CONFIRM,,}" == "y" || "${_PRUNE_CONFIRM,,}" == "yes" ]]; then
+                find "${_FOUND_BAKS[@]}" -maxdepth 0 -mtime +30 -exec rm -rf {} + 2>/dev/null
+                log "Pruned ${_OLDER_30} old backup(s)."
+            fi
+        fi
+    fi
+fi
+
+# v1.1.9 (#3): snapshot /etc/letsencrypt before any certbot venv work so an
+# upgrade-broken renewer is recoverable without resorting to npm-backup.
+# Runs for both fresh AND update — fresh installs over a previous certbot
+# leave behind state worth keeping; update is the obvious case.
+if [[ -d /etc/letsencrypt ]]; then
+    LE_BACKUP="/etc/letsencrypt.bak-$(date +%Y%m%d%H%M%S)"
+    if cp -a /etc/letsencrypt "${LE_BACKUP}" 2>/dev/null; then
+        warn "Let's Encrypt state backed up to ${LE_BACKUP}"
+    else
+        warn "Failed to back up /etc/letsencrypt ${G_DASH} proceeding anyway"
+    fi
+fi
+
+# v1.1.10 (#4): tarball /etc/nginx before the conf wipe in Step 6b.
+# Customisations to nginx.conf (set_real_ip_from for new CDN, custom
+# log_format, raised client_max_body_size, extra `include`) live here
+# and get wiped wholesale. Tar -C / keeps paths relative to root for
+# clean restore: `tar -xzf <file> -C /`.
+if [[ -d /etc/nginx ]]; then
+    mkdir -p /var/backups 2>/dev/null || true
+    NGINX_BACKUP="/var/backups/etc-nginx.bak-$(date +%Y%m%d%H%M%S).tar.gz"
+    if tar -czf "${NGINX_BACKUP}" -C / etc/nginx 2>/dev/null; then
+        warn "/etc/nginx tarball backed up to ${NGINX_BACKUP}"
+    else
+        warn "Failed to tar /etc/nginx ${G_DASH} proceeding anyway"
+    fi
 fi
 echo ""
 
@@ -616,11 +1024,17 @@ _prepare_for_install
 _maybe_upgrade_system() {
 # Optional: system upgrade (fresh install only)
 # ---------------------------------------------------------------------------
-if [[ "${INSTALL_MODE}" == "fresh" ]] && [[ -t 0 ]]; then
+# v1.1.11 (#2): offer apt upgrade in update mode too — long-lived hosts
+# often have package sets older than the NPM version being installed.
+if [[ "${INSTALL_MODE}" != "verify" ]] && [[ -t 0 ]]; then
     echo -e "  ${BOLD}System package upgrade${NC}"
-    echo -e "  ${DIM}Updating system packages ensures a clean foundation for the install.${NC}"
+    if [[ "${INSTALL_MODE}" == "update" ]]; then
+        echo -e "  ${DIM}Pulling in pending security/maintenance updates before NPM is reinstalled.${NC}"
+    else
+        echo -e "  ${DIM}Updating system packages ensures a clean foundation for the install.${NC}"
+    fi
     echo ""
-    read -rp "  Run apt update && apt upgrade before installing? [y/N]: " _UPG_CHOICE || true
+    read -rp "  Run apt update && apt upgrade now? [y/N]: " _UPG_CHOICE || true
     if [[ "${_UPG_CHOICE,,}" == "y" || "${_UPG_CHOICE,,}" == "yes" ]]; then
         step "Updating system packages (apt update && apt upgrade)"
         export DEBIAN_FRONTEND=noninteractive
@@ -628,7 +1042,7 @@ if [[ "${INSTALL_MODE}" == "fresh" ]] && [[ -t 0 ]]; then
         vrun apt-get upgrade -y -qq
         log "System packages updated."
     else
-        echo -e "  ${DIM}Skipped — continuing with current package versions.${NC}"
+        echo -e "  ${DIM}Skipped ${G_DASH} continuing with current package versions.${NC}"
     fi
     echo ""
 fi
@@ -641,7 +1055,7 @@ _maybe_upgrade_system
 _step1_install_deps() {
 # Step 1 — System dependencies
 # ---------------------------------------------------------------------------
-step "Step 1/7 — Installing system dependencies"
+step "Step 1/7 ${G_DASH} Installing system dependencies"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -703,7 +1117,7 @@ _step1b_certbot_venv
 _step2_install_node() {
 # Step 2 — Node.js (via NodeSource)
 # ---------------------------------------------------------------------------
-step "Step 2/7 — Installing Node.js ${NODE_MAJOR} LTS"
+step "Step 2/7 ${G_DASH} Installing Node.js ${NODE_MAJOR} LTS"
 
 # Detect existing Node.js and check if it meets the required major version.
 # NOTE: Debian Trixie ships nodejs v20 in its own repos but does NOT include
@@ -712,7 +1126,7 @@ _NEED_NODE=true
 if command -v node &>/dev/null; then
     EXISTING_NODE=$(node --version 2>/dev/null | grep -oP '\d+' | head -1)
     if [[ "${EXISTING_NODE}" -ge "${NODE_MAJOR}" ]]; then
-        log "Node.js $(node --version) already installed — skipping."
+        log "Node.js $(node --version) already installed ${G_DASH} skipping."
         _NEED_NODE=false
     else
         warn "Node.js $(node --version) is too old (need v${NODE_MAJOR}+). Upgrading..."
@@ -730,7 +1144,7 @@ if ${_NEED_NODE}; then
         info "NodeSource repo configured."
         vrun apt-get install -y nodejs
     else
-        warn "NodeSource setup failed — falling back to system nodejs+npm packages."
+        warn "NodeSource setup failed ${G_DASH} falling back to system nodejs+npm packages."
         vrun apt-get install -y nodejs npm
     fi
 
@@ -740,14 +1154,14 @@ if ${_NEED_NODE}; then
         log "Node.js $(node --version) installed."
     else
         warn "Node.js ${NODE_MAJOR}+ could not be installed (got: $(node --version 2>/dev/null || echo 'none'))."
-        warn "Continuing — pnpm install may fail if node version is too old."
+        warn "Continuing ${G_DASH} pnpm install may fail if node version is too old."
     fi
 fi
 
 # Ensure npm is available — nodesource nodejs bundles npm, but Debian's
 # nodejs package does NOT. Install separately only if truly missing.
 if ! command -v npm &>/dev/null; then
-    warn "npm not found — installing npm separately..."
+    warn "npm not found ${G_DASH} installing npm separately..."
     # Try installing npm that matches the installed Node version via npm itself
     # (corepack is available in Node 22+ and is the preferred approach)
     if command -v corepack &>/dev/null; then
@@ -773,7 +1187,7 @@ _step2_install_node
 _step3_clone_source() {
 # Step 3 — Clone NPM source via git (full working tree, no export-ignore gaps)
 # ---------------------------------------------------------------------------
-step "Step 3/7 — Cloning NPM v${NPM_VERSION} source"
+step "Step 3/7 ${G_DASH} Cloning NPM v${NPM_VERSION} source"
 
 # WHY git clone instead of the GitHub release tarball:
 #
@@ -791,7 +1205,7 @@ rm -rf "${NPM_TMP}"
 GIT_URL="https://github.com/NginxProxyManager/nginx-proxy-manager.git"
 info "Cloning v${NPM_VERSION} (shallow, ~60 MB)..."
 vrun git clone --depth 1 --branch "v${NPM_VERSION}" "${GIT_URL}" "${NPM_TMP}" --config advice.detachedHead=false
-[[ -d "${NPM_TMP}/frontend" ]] || die "Clone incomplete — frontend/ directory missing."
+[[ -d "${NPM_TMP}/frontend" ]] || die "Clone incomplete ${G_DASH} frontend/ directory missing."
 
 log "Source cloned to ${NPM_TMP}" 
 
@@ -803,7 +1217,7 @@ _step3_clone_source
 _step4_build_frontend() {
 # Build the frontend
 # ---------------------------------------------------------------------------
-step "Step 4/7 — Building frontend (this may take a few minutes)"
+step "Step 4/7 ${G_DASH} Building frontend (this may take a few minutes)"
 
 # Write the vite chunk-splitting patch script to /tmp (used later in this step)
 cat > "${_VITE_PATCH}" << 'VITE_PATCH_EOF'
@@ -881,7 +1295,7 @@ if grep -q '"react-intl"' "${_FRONTEND_PKG}" 2>/dev/null; then
     # future v10.x with breaking changes. `~10.1.0` allows patch updates only.
     jq '.dependencies["react-intl"] = "~10.1.0"' "${_FRONTEND_PKG}" \
         > "${_FRONTEND_PKG}.tmp" && mv "${_FRONTEND_PKG}.tmp" "${_FRONTEND_PKG}"
-    info "react-intl patched: ^8.x → ~10.1.0 (v9 broken/deprecated; v10 API-compatible)"
+    info "react-intl patched: ^8.x ${G_ARROW} ~10.1.0 (v9 broken/deprecated; v10 API-compatible)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -892,11 +1306,35 @@ fi
 # allow-list, `pnpm install` aborts with ERR_PNPM_IGNORED_BUILDS for packages
 # like @parcel/watcher and esbuild. Patch the manifest before pnpm install so
 # the resolver sees the allow-list from the very first run.
-_FRONTEND_BUILDS='["@parcel/watcher","esbuild","@swc/core","unrs-resolver","@biomejs/biome","sass"]'
-jq --argjson b "${_FRONTEND_BUILDS}" \
-   '.pnpm = (.pnpm // {}) | .pnpm.onlyBuiltDependencies = $b' \
-   "${_FRONTEND_PKG}" > "${_FRONTEND_PKG}.tmp" && mv "${_FRONTEND_PKG}.tmp" "${_FRONTEND_PKG}"
-info "frontend pnpm.onlyBuiltDependencies set: @parcel/watcher, esbuild, @swc/core, unrs-resolver, @biomejs/biome, sass"
+# v1.1.15: the legacy jq write to .pnpm.onlyBuiltDependencies was removed
+# here. pnpm v11 ignored the package.json key (warning loop in install output);
+# pnpm v10 reads onlyBuiltDependencies from pnpm-workspace.yaml just fine.
+# The YAML below carries the allow-list for both major versions.
+
+# v1.1.14: pnpm v11 removed `onlyBuiltDependencies` from package.json and
+# replaced it with `allowBuilds` in pnpm-workspace.yaml. Different schema:
+# map of name -> bool, not an array. Write both keys for compatibility.
+# The package.json jq patch above is harmless belt-and-suspenders.
+cat > "${NPM_TMP}/frontend/pnpm-workspace.yaml" << 'YAML_FE'
+# pnpm v11+: allowBuilds (map of package -> bool)
+allowBuilds:
+  "@parcel/watcher": true
+  esbuild: true
+  "@swc/core": true
+  unrs-resolver: true
+  "@biomejs/biome": true
+  sass: true
+
+# pnpm v10 compatibility: ignored by v11
+onlyBuiltDependencies:
+  - "@parcel/watcher"
+  - esbuild
+  - "@swc/core"
+  - unrs-resolver
+  - "@biomejs/biome"
+  - sass
+YAML_FE
+info "wrote frontend/pnpm-workspace.yaml (allowBuilds for pnpm v11+, onlyBuiltDependencies for v10)"
 
 # ---------------------------------------------------------------------------
 # Clean pnpm store before install
@@ -920,23 +1358,35 @@ pnpm store prune --force 2>/dev/null || true
 # warning. Reported in #5.
 info "pnpm store: pruned"
 
+# v1.1.13: pnpm fetch resilience.
+# registry.npmjs.org occasionally serves metadata requests that take longer
+# than pnpm's default 60s fetch-timeout (real reports of 75s+). The default
+# 2 retries are also light. Bump both via npm_config_* env so they apply to
+# every pnpm call below. Operators can override by exporting the same names
+# before running the installer.
+export npm_config_fetch_timeout="${npm_config_fetch_timeout:-300000}"
+export npm_config_fetch_retries="${npm_config_fetch_retries:-5}"
+export npm_config_fetch_retry_mintimeout="${npm_config_fetch_retry_mintimeout:-30000}"
+export npm_config_fetch_retry_maxtimeout="${npm_config_fetch_retry_maxtimeout:-180000}"
+export npm_config_network_concurrency="${npm_config_network_concurrency:-4}"
+info "pnpm fetch tunables: timeout=$((npm_config_fetch_timeout/1000))s retries=${npm_config_fetch_retries} concurrency=${npm_config_network_concurrency}"
+
 info "Installing frontend dependencies..."
 # --reporter=silent suppresses deprecation WARNs from upstream package.json pins
 # (e.g. react-intl@8.x deprecated by upstream). These are informational only
 # and don't affect functionality. In verbose mode, full output is shown.
-# NOTE: previous revision ran `pnpm install --reporter=silent || pnpm install`
-# which doubled install time on slow connections for no diagnostic gain.
+# v1.1.13: wrapped with retry helper to survive transient registry blips.
 if ${VERBOSE}; then
-    pnpm install
+    _pnpm_install_with_retry pnpm install
 else
-    pnpm install --reporter=silent
+    _pnpm_install_with_retry pnpm install --reporter=silent
 fi
 
 info "Upgrading frontend dependencies to latest compatible versions..."
 if ${VERBOSE}; then
-    pnpm upgrade
+    _pnpm_install_with_retry pnpm upgrade
 else
-    pnpm upgrade --reporter=silent
+    _pnpm_install_with_retry pnpm upgrade --reporter=silent
 fi
 
 # ---------------------------------------------------------------------------
@@ -1042,7 +1492,7 @@ _VITE_CFG="${NPM_TMP}/frontend/vite.config.ts"
 if [[ -f "${_VITE_CFG}" ]]; then
     python3 "${_VITE_PATCH}" "${_VITE_CFG}" \
         && info "vite.config.ts: manualChunks applied (vendor chunk splitting)" \
-        || warn "vite.config.ts patch failed — build continues without chunk split"
+        || warn "vite.config.ts patch failed ${G_DASH} build continues without chunk split"
 fi
 
 # ── Patch tsconfig.json: exclude test files from production build ─────────────
@@ -1111,7 +1561,7 @@ if [[ -f "${_TSCONFIG}" ]]; then
 fi
 info "Running production build..."
 echo ""
-echo -e "  ${YELLOW}${BOLD}Building frontend — this may take 3-5 minutes.${NC}"
+echo -e "  ${YELLOW}${BOLD}Building frontend ${G_DASH} this may take 3-5 minutes.${NC}"
 echo -e "  ${DIM}Vite transforms ~7000 modules. Please be patient.${NC}"
 echo ""
 
@@ -1125,7 +1575,7 @@ _build_with_progress() {
     : > "${_BUILD_LOG}"  # truncate log
     timeout 600 bash -c 'export NODE_OPTIONS="--max-old-space-size=2048"; pnpm run build' > "${_BUILD_LOG}" 2>&1 &
     local _pid=$!
-    local _spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local _spin="${G_SPIN_CHARS}"
     local _start=${SECONDS}
     local _i=0 _status=0 _elapsed _last_line
 
@@ -1160,10 +1610,12 @@ for _attempt in 1 2; do
         _build_with_progress && { _build_ok=true; break; }
     fi
     if [[ ${_attempt} -eq 1 ]]; then
-        warn "Build timed out or failed (attempt 1) — clearing pnpm store and retrying..."
+        warn "Build timed out or failed (attempt 1) ${G_DASH} clearing pnpm store and retrying..."
         pnpm store prune --force 2>/dev/null || true
-        # Force re-download of all packages to ensure a clean store state
-        pnpm install --force --reporter=silent 2>/dev/null || pnpm install --force &>/dev/null || true
+        # Force re-download of all packages to ensure a clean store state.
+        # v1.1.13: wrapped with retry helper; failure here is non-fatal so
+        # the outer build retry still gets a chance.
+        _pnpm_install_with_retry pnpm install --force --reporter=silent || true
     fi
 done
 ${_build_ok} || die "Frontend build failed after retry. Run with --verbose for details."
@@ -1179,7 +1631,7 @@ _step4_build_frontend
 _step5_install_backend() {
 # Install backend node_modules (production only)
 # ---------------------------------------------------------------------------
-step "Step 5/7 → 6/7 — Assembling install directory"
+step "Step 5/7 ${G_ARROW} 6/7 ${G_DASH} Assembling install directory"
 
 # ---------------------------------------------------------------------------
 # Assemble install dir FIRST, then install backend deps in-place
@@ -1189,12 +1641,21 @@ step "Step 5/7 → 6/7 — Assembling install directory"
 # can leave symlinks dangling and native binaries (sqlite3.node) unresolvable.
 # Install directly in the final location to guarantee correct resolution.
 
-step "Step 6/7 — Installing backend dependencies and configuring"
+step "Step 6/7 ${G_DASH} Installing backend dependencies and configuring"
+
+# v1.1.9 (#2): stop the service NOW, just before the install swap. In
+# --update mode the service has been serving traffic through the entire
+# frontend build above; this is the start of the unavoidable downtime
+# window. Fresh installs are a no-op here (nothing to stop).
+if [[ "${INSTALL_MODE}" == "update" ]] && systemctl is-active --quiet "${NPM_SERVICE}" 2>/dev/null; then
+    info "Stopping ${NPM_SERVICE} for the install swap..."
+    systemctl stop "${NPM_SERVICE}" 2>/dev/null || true
+fi
 
 # Backup existing install if present
 if [[ -d "${NPM_HOME}" ]]; then
     BACKUP="${NPM_HOME}.bak-$(date +%Y%m%d%H%M%S)"
-    warn "Existing install found — backing up to ${BACKUP}"
+    warn "Existing install found ${G_DASH} backing up to ${BACKUP}"
     mv "${NPM_HOME}" "${BACKUP}"
 fi
 
@@ -1228,9 +1689,9 @@ jq --arg v "${NPM_VERSION}" '.version = $v' "${_PKGJSON}" > "${_PKGJSON}.tmp" \
     && mv "${_PKGJSON}.tmp" "${_PKGJSON}"
 _AFTER=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['version'])" "${_PKGJSON}" 2>/dev/null || echo "error")
 if [[ "${_AFTER}" == "${NPM_VERSION}" ]]; then
-    info "Version patched: ${_BEFORE} → v${_AFTER}"
+    info "Version patched: ${_BEFORE} ${G_ARROW} v${_AFTER}"
 else
-    warn "Version patch failed — footer may show wrong version (got ${_AFTER})"
+    warn "Version patch failed ${G_DASH} footer may show wrong version (got ${_AFTER})"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1270,6 +1731,24 @@ else:
 PYHTTP2
         log "Patched NPM's _listen.conf for nginx ${_NGINX_VER} (< 1.25.1)"
     fi
+
+    # v1.1.9 (#1): strip stale `http2 on;` / `http2 off;` lines from any
+    # proxy host configs that NPM previously generated. Without this an
+    # --update from Docker or a system that briefly had nginx 1.25+
+    # leaves /data/nginx/proxy_host/*.conf with directives nginx 1.22.1
+    # rejects, and the service refuses to start. Anchored regex: only
+    # whole-line bare `http2 on;` / `http2 off;` directives are stripped —
+    # legacy `listen 443 ssl http2;` syntax is preserved.
+    if [[ -d "${NPM_DATA}/nginx" ]]; then
+        _STALE_COUNT=$(grep -rlE '^[[:space:]]*http2[[:space:]]+(on|off);[[:space:]]*$' \
+            "${NPM_DATA}/nginx" 2>/dev/null | wc -l)
+        if [[ "${_STALE_COUNT}" -gt 0 ]]; then
+            warn "Stripping bare http2 directives from ${_STALE_COUNT} existing ${NPM_DATA}/nginx/**/*.conf file(s)"
+            find "${NPM_DATA}/nginx" -name '*.conf' -exec \
+                sed -i '/^[[:space:]]*http2[[:space:]]\+o\(n\|ff\);[[:space:]]*$/d' {} +
+            log "Cleaned ${_STALE_COUNT} stale config(s); proxy hosts will validate after nginx restart"
+        fi
+    fi
 fi
 
 info "Installing backend node_modules in final location..."
@@ -1290,40 +1769,68 @@ cd "${NPM_HOME}/backend"
 # ---------------------------------------------------------------------------
 
 PKGJSON="${NPM_HOME}/backend/package.json"
-ALLOWED_BUILDS='["bcrypt","sqlite3","better-sqlite3","@mapbox/node-pre-gyp","node-pre-gyp","node-gyp","@parcel/watcher","esbuild"]'
 
-# Single jq pass: set onlyBuiltDependencies, upgrade direct deps with deprecated
-# transitive chains, and add pnpm.overrides for fixable subdependencies.
+# v1.1.15: jq now only patches non-pnpm-config keys. pnpm.* moved to
+# pnpm-workspace.yaml because pnpm v11 ignores the package.json pnpm field.
 #
-# Deprecated subdependency map — 5 of 12 fixable here:
-#   glob@7.x/10.x → ^11.0.0  (security-deprecated by maintainer)
-#   rimraf@3.x    → ^6.0.0   (deprecated)
-#   tar@6.x       → ^7.0.0   (deprecated; sqlite3@6.x also drops this)
-#   uuid@3.x      → ^10.0.0  (via node-pre-gyp@0.17.0)
-#   sqlite3@5.x   → ^6.0.0   (direct upgrade; v6 uses tar@^7 not tar@^6)
-#   knex@3.1.x    → ^3.2.0   (latest bugfix release)
+# Direct dependency pins kept here (real package.json dependencies, not pnpm config):
+#   sqlite3   ^5.x -> ^6.0.0 (v6 drops tar@^6, picks up tar@^7)
+#   knex      3.1.x -> ^3.2.0 (latest bugfix release)
 #
-# Unfixable — every published version is deprecated, deep in build toolchain:
-#   prebuild-install, inflight, npmlog, are-we-there-yet, gauge,
-#   querystring, @npmcli/move-file
-jq --argjson deps "${ALLOWED_BUILDS}" '
-    .pnpm = (.pnpm // {}) |
-    .pnpm.onlyBuiltDependencies = $deps |
-    .pnpm.overrides = (.pnpm.overrides // {}) |
-    .pnpm.overrides.glob   = "^11.0.0" |
-    .pnpm.overrides.rimraf = "^6.0.0"  |
-    .pnpm.overrides.tar    = "^7.0.0"  |
-    .pnpm.overrides.uuid   = "^10.0.0" |
-    .dependencies.sqlite3  = "^6.0.0"  |
-    .dependencies.knex     = "^3.2.0"
-' "${PKGJSON}" > "${PKGJSON}.tmp" && mv "${PKGJSON}.tmp" "${PKGJSON}"
-info "pnpm.onlyBuiltDependencies set: bcrypt, sqlite3, better-sqlite3, node-pre-gyp"
-info "pnpm.overrides: glob→11.x rimraf→6.x tar→7.x uuid→10.x; sqlite3→6.x knex→3.2.x" 
+# Override pins for deprecated transitive deps live in pnpm-workspace.yaml below:
+#   glob/rimraf/tar/uuid (fixable);  prebuild-install/inflight/npmlog (unfixable)
+jq '.dependencies.sqlite3 = "^6.0.0" |
+    .dependencies.knex    = "^3.2.0"' \
+    "${PKGJSON}" > "${PKGJSON}.tmp" && mv "${PKGJSON}.tmp" "${PKGJSON}"
+info "Backend dependencies pinned: sqlite3 ^6.0.0, knex ^3.2.0 (overrides moved to pnpm-workspace.yaml)"
 
+# v1.1.14: pnpm v11 ignores .pnpm.onlyBuiltDependencies in package.json.
+# Write the allow-list in pnpm-workspace.yaml as `allowBuilds` (v11 schema)
+# AND `onlyBuiltDependencies` (v10 schema). Whichever pnpm version is in
+# use picks up its respective key.
+cat > "${NPM_HOME}/backend/pnpm-workspace.yaml" << 'YAML_BE'
+# pnpm v11+: allowBuilds (map of package -> bool)
+allowBuilds:
+  bcrypt: true
+  sqlite3: true
+  better-sqlite3: true
+  "@mapbox/node-pre-gyp": true
+  node-pre-gyp: true
+  node-gyp: true
+  "@parcel/watcher": true
+  esbuild: true
+
+# pnpm v10 compatibility: ignored by v11
+onlyBuiltDependencies:
+  - bcrypt
+  - sqlite3
+  - better-sqlite3
+  - "@mapbox/node-pre-gyp"
+  - node-pre-gyp
+  - node-gyp
+  - "@parcel/watcher"
+  - esbuild
+
+# v1.1.15: overrides moved from package.json (pnpm v11 ignored the .pnpm field).
+# Pins deprecated transitive deps to maintained versions:
+#   glob v7/v10  -> v11 (security-deprecated by upstream maintainer)
+#   rimraf v3/v4 -> v6  (deprecated)
+#   tar v6       -> v7  (deprecated; sqlite3@6 drops the chain naturally)
+#   uuid v3/v8   -> v10 (deprecated)
+overrides:
+  glob: ^11.0.0
+  rimraf: ^6.0.0
+  tar: ^7.0.0
+  uuid: ^10.0.0
+YAML_BE
+info "wrote backend/pnpm-workspace.yaml (allowBuilds for pnpm v11+, onlyBuiltDependencies for v10)"
+
+# v1.1.13: backend install wrapped with retry; same fetch tunables apply
+# (env vars are inherited from the frontend step's exports above).
 if ${VERBOSE}; then
-    pnpm install --prod
+    _pnpm_install_with_retry pnpm install --prod
 else
-    pnpm install --prod --reporter=silent
+    _pnpm_install_with_retry pnpm install --prod --reporter=silent
 fi
 
 # ---------------------------------------------------------------------------
@@ -1401,7 +1908,7 @@ if [[ -d "${NPM_TMP}/frontend/app-images" ]]; then
     info "app-images copied."
 fi
 # Verify the critical index.html is in place
-[[ -f "${NPM_HOME}/frontend/index.html" ]]     && log "frontend/index.html : present"     || die "frontend/index.html missing after copy — frontend will not load"
+[[ -f "${NPM_HOME}/frontend/index.html" ]]     && log "frontend/index.html : present"     || die "frontend/index.html missing after copy ${G_DASH} frontend will not load"
 
 # ---------------------------------------------------------------------------
 # Create lang/ directory with locale files
@@ -1849,7 +2356,7 @@ if [[ -d "${NPM_TMP}/docker/rootfs/etc/nginx/conf.d/include" ]]; then
     cp "${NPM_TMP}/docker/rootfs/etc/nginx/conf.d/include/"*.conf         /etc/nginx/conf.d/include/ 2>/dev/null || true
     log "Copied nginx include files (proxy.conf, block-exploits.conf, etc.)"
 else
-    warn "docker/rootfs/etc/nginx/conf.d/include not found — proxy host configs may fail"
+    warn "docker/rootfs/etc/nginx/conf.d/include not found ${G_DASH} proxy host configs may fail"
 fi
 
 # ── Create custom snippet stubs for NPM template includes ─────────────────────
@@ -1871,11 +2378,11 @@ mkdir -p /var/www/html
     cp -r "${NPM_TMP}/docker/rootfs/var/www/html/"* /var/www/html/ 2>/dev/null || true
 
 # ── Validate and start nginx ──────────────────────────────────────────────────
-nginx -t &>/dev/null || die "nginx config test failed — run: nginx -t for details."
+nginx -t &>/dev/null || die "nginx config test failed ${G_DASH} run: nginx -t for details."
 
 # Enable nginx to start on boot and verify the symlink was created
 systemctl enable nginx 2>/dev/null || true
-systemctl is-enabled nginx &>/dev/null || warn "nginx may not be enabled for autostart — run: systemctl enable nginx"
+systemctl is-enabled nginx &>/dev/null || warn "nginx may not be enabled for autostart ${G_DASH} run: systemctl enable nginx"
 log "nginx enabled for autostart."  
 # Redirect all 3 fds: systemd uses isatty(stdout) to decide whether to stream journal.
 # With stdout=/dev/null, isatty() returns false → no journal stream registered.
@@ -1898,7 +2405,7 @@ fi
 if systemctl is-active --quiet nginx 2>/dev/null; then
     log "nginx configured, enabled, and running."
 else
-    die "nginx failed to start — run: systemctl status nginx  or: journalctl -u nginx -n 30"
+    die "nginx failed to start ${G_DASH} run: systemctl status nginx  or: journalctl -u nginx -n 30"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1932,7 +2439,19 @@ _step6c_logrotate
 _step7_systemd_service() {
 # Create systemd service
 # ---------------------------------------------------------------------------
-step "Step 7/7 — Creating systemd service and starting NPM"
+step "Step 7/7 ${G_DASH} Creating systemd service and starting NPM"
+
+# v1.1.10 (#5): back up + warn before replacing the main unit. Drop-ins
+# under ${NPM_SERVICE}.service.d/ (added via `systemctl edit`) are
+# preserved across the rewrite; lines added directly to the main unit
+# (Environment=DEBUG=..., custom ExecStart args) are lost.
+if [[ "${INSTALL_MODE}" == "update" ]] && [[ -f "/etc/systemd/system/${NPM_SERVICE}.service" ]]; then
+    UNIT_BACKUP="/etc/systemd/system/${NPM_SERVICE}.service.bak-$(date +%Y%m%d%H%M%S)"
+    if cp "/etc/systemd/system/${NPM_SERVICE}.service" "${UNIT_BACKUP}" 2>/dev/null; then
+        warn "Existing systemd unit backed up to ${UNIT_BACKUP}"
+    fi
+    warn "Replacing main systemd unit. Drop-ins under ${NPM_SERVICE}.service.d/ are preserved; Environment= / ExecStart= lines added directly to the main unit will be lost."
+fi
 
 cat > "/etc/systemd/system/${NPM_SERVICE}.service" <<SERVICE
 [Unit]
@@ -1984,7 +2503,7 @@ systemctl enable "${NPM_SERVICE}" 2>/dev/null || true
 if systemctl is-enabled "${NPM_SERVICE}" &>/dev/null; then
     log "Service ${NPM_SERVICE} enabled for autostart on boot."
 else
-    warn "Service ${NPM_SERVICE} may not be enabled — run: systemctl enable ${NPM_SERVICE}"
+    warn "Service ${NPM_SERVICE} may not be enabled ${G_DASH} run: systemctl enable ${NPM_SERVICE}"
 fi
 
 # ── ROOT CAUSE of journal leak ────────────────────────────────────────────
@@ -2044,7 +2563,23 @@ if [[ ${RETRIES} -eq 0 ]]; then
     warn "NPM did not respond within $((30 * INTERVAL))s."
     warn "Check: journalctl -u ${NPM_SERVICE} -n 40 --no-pager"
 else
-    log "NPM is up and responding."
+    # v1.1.9 (#6): beyond connectivity — verify the API actually reports OK.
+    # Express binds the port the moment Node starts, BEFORE knex migrations
+    # finish (or fail). Without this check, a migration failure looks like
+    # a successful start. Up to 3 attempts, 2s apart, total <=6s extra.
+    _API_HEALTH="?"
+    for _attempt in 1 2 3; do
+        _API_HEALTH=$(curl -sf --max-time 5 "http://127.0.0.1:${ADMIN_PORT}/api/" 2>/dev/null \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo "?")
+        [[ "${_API_HEALTH}" == "OK" ]] && break
+        sleep 2
+    done
+    if [[ "${_API_HEALTH}" == "OK" ]]; then
+        log "NPM is up and responding (API health: OK)."
+    else
+        warn "Service responding on port ${ADMIN_PORT}, but /api/ returned '\''${_API_HEALTH}'\'' instead of OK."
+        warn "Likely cause: knex migration failure. Check: journalctl -u ${NPM_SERVICE} -n 40 --no-pager"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -2057,21 +2592,36 @@ _finalize() {
 # ---------------------------------------------------------------------------
 vrun rm -rf "${NPM_TMP}"
 
+# v1.1.10 (#7): prune old ${NPM_HOME}.bak-* directories after a successful
+# install. Each backup carries node_modules (~400 MB), so unbounded
+# accumulation eats /opt. Keeps NPM_KEEP_BACKUPS most recent (default 2).
+# Set NPM_KEEP_BACKUPS=0 to wipe all, NPM_KEEP_BACKUPS=999 to keep
+# essentially everything.
+_KEEP=${NPM_KEEP_BACKUPS:-2}
+if [[ "${_KEEP}" =~ ^[0-9]+$ ]]; then
+    _STALE=$(ls -1dt "${NPM_HOME}".bak-* 2>/dev/null | tail -n +$(( _KEEP + 1 )))
+    if [[ -n "${_STALE}" ]]; then
+        _N=$(echo "${_STALE}" | wc -l)
+        info "Pruning ${_N} old install backup(s), keeping ${_KEEP} most recent (override via NPM_KEEP_BACKUPS=N)"
+        echo "${_STALE}" | xargs -r rm -rf
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Final status + summary
 # ---------------------------------------------------------------------------
 HOST_IP=$(hostname -I | awk '{print $1}')
 
 echo ""
-echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${GREEN}║      Nginx Proxy Manager — Installation Complete         ║${NC}"
-echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}${GREEN}${G_TL2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_TR2}${NC}"
+echo -e "${BOLD}${GREEN}${G_VBAR2}      Nginx Proxy Manager ${G_DASH} Installation Complete         ${G_VBAR2}${NC}"
+echo -e "${BOLD}${GREEN}${G_BL2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_BR2}${NC}"
 echo ""
 echo -e "  ${CYAN}Admin Panel :${NC} ${BOLD}http://${HOST_IP}:${ADMIN_PORT}${NC}"
 echo -e "  ${CYAN}Version     :${NC} v${NPM_VERSION}"
 echo -e "  ${CYAN}Service     :${NC} ${NPM_SERVICE}"
 echo ""
-echo -e "  ${YELLOW}➜  Open the admin panel to create your account.${NC}"
+echo -e "  ${YELLOW}${G_ARROW_HEAVY}  Open the admin panel to create your account.${NC}"
 echo ""
 # Safety net: close both stdout and stderr after all output is done.
 # Any residual journal stream that systemd registered against this TTY will
