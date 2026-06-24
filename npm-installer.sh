@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.15 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.13 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.1.15 — pnpm v11 overrides + verify expansion:
-#    - Move pnpm.overrides into pnpm-workspace.yaml. pnpm v11 ignored the
-#      package.json `pnpm` field, so glob/rimraf/tar/uuid pins were not
-#      being applied (deprecated subdeps like prebuild-install still
-#      pulled in). Stop writing the legacy .pnpm.* keys to package.json
-#      entirely; ends the "no longer read by pnpm" warning loop in the
-#      install output. Keep only the non-pnpm-config jq writes (.version,
-#      .dependencies.sqlite3, .dependencies.knex).
-#    - Verify mode adds two sections: Environment (disk free per mount,
-#      time sync active, db integrity, db contents) and External
-#      (Let'\''s Encrypt API reachable, per-domain cert expiry days).
+#  v1.1.18 — splash column alignment:
+#    The 9-character "Installed" label introduced in v1.1.17 made its colon
+#    sit one column further right than every other label in the splash
+#    header, throwing the column out of alignment. All splash labels are
+#    now right-padded to a 10-character field so every colon lines up
+#    regardless of whether the Installed line is shown.
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -28,7 +23,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.15"           # installer script version
+SCRIPT_VERSION="1.1.18"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -236,13 +231,21 @@ done
 _resolve_npm_version() {
 # Auto-detect latest NPM version from GitHub if not specified
 # ---------------------------------------------------------------------------
+# v1.1.17: track WHERE NPM_VERSION came from so the splash can label it.
+#   latest   -- auto-resolved from the GitHub releases API
+#   pinned   -- caller passed NPM_VERSION env or --version
+#   fallback -- GitHub unreachable, used the hard-coded fallback
 if [[ -z "${NPM_VERSION}" ]]; then
     _LATEST=$(curl -sf --max-time 10         "https://api.github.com/repos/NginxProxyManager/nginx-proxy-manager/releases/latest"         | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))"         2>/dev/null || true)
     if [[ -n "${_LATEST}" ]]; then
         NPM_VERSION="${_LATEST}"
+        _NPM_VERSION_SOURCE="latest"
     else
         NPM_VERSION="2.14.0"   # hard fallback if GitHub is unreachable
+        _NPM_VERSION_SOURCE="fallback"
     fi
+else
+    _NPM_VERSION_SOURCE="pinned"
 fi
 
 # ---------------------------------------------------------------------------
@@ -269,12 +272,43 @@ echo -e "  ${DIM}No Docker ${G_DOT} SQLite ${G_DOT} Systemd ${G_DOT} Team Njordi
 echo -e "  ${DIM}---------------------------------------------${NC}"
 echo ""
 _TOTAL_RAM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo "0")
-echo -e "  ${CYAN}Version  :${NC} ${BOLD}v${NPM_VERSION}${NC}     ${CYAN}Node.js :${NC} ${BOLD}v${NODE_MAJOR} LTS${NC}"
-echo -e "  ${CYAN}Install  :${NC} ${NPM_HOME}"
-echo -e "  ${CYAN}Data     :${NC} ${NPM_DATA}"
-echo -e "  ${CYAN}Database :${NC} SQLite (${NPM_DATA}/database.sqlite)"
-echo -e "  ${CYAN}Service  :${NC} ${NPM_SERVICE}"
-echo -e "  ${CYAN}Memory   :${NC} ${_TOTAL_RAM_MB} MB   ${CYAN}Minimum :${NC} ${BOLD}2048 MB (2 GB)${NC}"
+# v1.1.17: show the target version with a source-aware label, and append
+# an Installed line if a prior install is detected. dpkg --compare-versions
+# is Debian/Ubuntu-native and handles semver edge cases (e.g. 2.14.10 > 2.14.2).
+_INSTALLED_NPM_VER=""
+if [[ -f "${NPM_HOME}/backend/package.json" ]]; then
+    _INSTALLED_NPM_VER=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version','?'))" \
+        "${NPM_HOME}/backend/package.json" 2>/dev/null || echo "")
+    [[ "${_INSTALLED_NPM_VER}" == "?" ]] && _INSTALLED_NPM_VER=""
+fi
+
+case "${_NPM_VERSION_SOURCE:-latest}" in
+    latest)   _NPM_VER_LABEL="Latest    " ;;
+    pinned)   _NPM_VER_LABEL="Target    " ;;
+    fallback) _NPM_VER_LABEL="Fallback  " ;;
+    *)        _NPM_VER_LABEL="Version   " ;;
+esac
+
+_NPM_STATUS_NOTE=""
+if [[ -n "${_INSTALLED_NPM_VER}" ]]; then
+    if [[ "${_INSTALLED_NPM_VER}" == "${NPM_VERSION}" ]]; then
+        _NPM_STATUS_NOTE="${GREEN}(up to date)${NC}"
+    elif dpkg --compare-versions "${_INSTALLED_NPM_VER}" lt "${NPM_VERSION}" 2>/dev/null; then
+        _NPM_STATUS_NOTE="${YELLOW}(update available)${NC}"
+    else
+        _NPM_STATUS_NOTE="${YELLOW}(installed is newer)${NC}"
+    fi
+fi
+
+echo -e "  ${CYAN}${_NPM_VER_LABEL}:${NC} ${BOLD}v${NPM_VERSION}${NC}     ${CYAN}Node.js   :${NC} ${BOLD}v${NODE_MAJOR} LTS${NC}"
+if [[ -n "${_INSTALLED_NPM_VER}" ]]; then
+    echo -e "  ${CYAN}Installed :${NC} ${BOLD}v${_INSTALLED_NPM_VER}${NC}  ${_NPM_STATUS_NOTE}"
+fi
+echo -e "  ${CYAN}Install   :${NC} ${NPM_HOME}"
+echo -e "  ${CYAN}Data      :${NC} ${NPM_DATA}"
+echo -e "  ${CYAN}Database  :${NC} SQLite (${NPM_DATA}/database.sqlite)"
+echo -e "  ${CYAN}Service   :${NC} ${NPM_SERVICE}"
+echo -e "  ${CYAN}Memory    :${NC} ${_TOTAL_RAM_MB} MB   ${CYAN}Minimum   :${NC} ${BOLD}2048 MB (2 GB)${NC}"
 echo ""
 if [[ "${_TOTAL_RAM_MB}" -gt 0 && "${_TOTAL_RAM_MB}" -lt 2048 ]]; then
     echo -e "  ${RED}${BOLD}WARNING: This system has ${_TOTAL_RAM_MB} MB RAM.${NC}"
@@ -1822,6 +1856,19 @@ overrides:
   rimraf: ^6.0.0
   tar: ^7.0.0
   uuid: ^10.0.0
+
+# v1.1.16: suppress noise for transitively-pulled deprecated packages with
+# no working replacement (they are deep inside the bcrypt / sqlite3 /
+# node-pre-gyp native build chain). New deprecations NOT listed here will
+# still surface as warnings, which is the right default.
+allowedDeprecatedVersions:
+  prebuild-install: "*"
+  querystring: "*"
+  inflight: "*"
+  npmlog: "*"
+  are-we-there-yet: "*"
+  gauge: "*"
+  "@npmcli/move-file": "*"
 YAML_BE
 info "wrote backend/pnpm-workspace.yaml (allowBuilds for pnpm v11+, onlyBuiltDependencies for v10)"
 
@@ -2577,8 +2624,12 @@ else
     if [[ "${_API_HEALTH}" == "OK" ]]; then
         log "NPM is up and responding (API health: OK)."
     else
-        warn "Service responding on port ${ADMIN_PORT}, but /api/ returned '\''${_API_HEALTH}'\'' instead of OK."
+        warn "Service responding on port ${ADMIN_PORT}, but /api/ returned '${_API_HEALTH}' instead of OK."
         warn "Likely cause: knex migration failure. Check: journalctl -u ${NPM_SERVICE} -n 40 --no-pager"
+        # v1.1.16: surface the unhealthy API to _finalize so it can print
+        # a yellow "completed with warnings" banner instead of green
+        # "Installation Complete".
+        _INSTALL_HEALTH="api_unhealthy"
     fi
 fi
 
@@ -2613,14 +2664,30 @@ fi
 HOST_IP=$(hostname -I | awk '{print $1}')
 
 echo ""
-echo -e "${BOLD}${GREEN}${G_TL2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_TR2}${NC}"
-echo -e "${BOLD}${GREEN}${G_VBAR2}      Nginx Proxy Manager ${G_DASH} Installation Complete         ${G_VBAR2}${NC}"
-echo -e "${BOLD}${GREEN}${G_BL2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_BR2}${NC}"
+# v1.1.16: banner colour reflects API health detected in _step7b. Green for
+# a clean install, yellow if /api/ didn'''t return {status:OK} after start.
+_BAR="${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}"
+if [[ "${_INSTALL_HEALTH:-ok}" == "ok" ]]; then
+    echo -e "${BOLD}${GREEN}${G_TL2}${_BAR}${G_TR2}${NC}"
+    echo -e "${BOLD}${GREEN}${G_VBAR2}      Nginx Proxy Manager ${G_DASH} Installation Complete         ${G_VBAR2}${NC}"
+    echo -e "${BOLD}${GREEN}${G_BL2}${_BAR}${G_BR2}${NC}"
+else
+    echo -e "${BOLD}${YELLOW}${G_TL2}${_BAR}${G_TR2}${NC}"
+    echo -e "${BOLD}${YELLOW}${G_VBAR2}  Nginx Proxy Manager ${G_DASH} Install completed with warnings  ${G_VBAR2}${NC}"
+    echo -e "${BOLD}${YELLOW}${G_BL2}${_BAR}${G_BR2}${NC}"
+fi
 echo ""
 echo -e "  ${CYAN}Admin Panel :${NC} ${BOLD}http://${HOST_IP}:${ADMIN_PORT}${NC}"
 echo -e "  ${CYAN}Version     :${NC} v${NPM_VERSION}"
 echo -e "  ${CYAN}Service     :${NC} ${NPM_SERVICE}"
 echo ""
+if [[ "${_INSTALL_HEALTH:-ok}" != "ok" ]]; then
+    echo -e "  ${YELLOW}API health   :${NC} ${_INSTALL_HEALTH} ${G_DASH} the service started but /api/ is not returning OK."
+    echo -e "  ${DIM}Investigate with:${NC}"
+    echo -e "    ${DIM}sudo journalctl -u ${NPM_SERVICE} -n 40 --no-pager${NC}"
+    echo -e "    ${DIM}sudo bash $0 --verify${NC}"
+    echo ""
+fi
 echo -e "  ${YELLOW}${G_ARROW_HEAVY}  Open the admin panel to create your account.${NC}"
 echo ""
 # Safety net: close both stdout and stderr after all output is done.
