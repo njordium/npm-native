@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.13 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.19 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.1.18 — splash column alignment:
-#    The 9-character "Installed" label introduced in v1.1.17 made its colon
-#    sit one column further right than every other label in the splash
-#    header, throwing the column out of alignment. All splash labels are
-#    now right-padded to a 10-character field so every colon lines up
-#    regardless of whether the Installed line is shown.
+#  v1.1.19 — auto-swap helper for low-RAM hosts:
+#    The frontend build needs ~2 GB of memory (TypeScript compiler, Vite,
+#    bundle assembly, sass, minify). On a 1 GB host the build was "dog
+#    slow" because the kernel was swap-thrashing without enough swap; on
+#    a 512 MB host it failed outright. When detected RAM < 2 GB and the
+#    existing swap is insufficient to cover the gap, the preflight check
+#    now offers to create /swapfile sized to bring total memory budget to
+#    2.5 GB. fallocate is preferred; falls back to dd on filesystems that
+#    don't support it. At end of install the operator can keep it for
+#    this boot only (default), persist via /etc/fstab, or remove the
+#    swap file. Override with NPM_AUTOSWAP=auto|true|false (default
+#    auto). No prompts and no system changes on hosts with >= 2 GB RAM.
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -23,7 +29,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.18"           # installer script version
+SCRIPT_VERSION="1.1.19"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -226,6 +232,50 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# v1.1.19: auto-swap helper for low-RAM hosts.
+# _create_swap <size_mb> [path]
+#   - Prefers fallocate; falls back to dd on filesystems that reject it.
+#   - chmod 600 before mkswap so swap contents arent world-readable.
+#   - Refuses to overwrite an existing file at the target path.
+#   - Sets _CREATED_SWAP so _finalize can offer the keep/remove/persist menu.
+_create_swap() {
+    local size_mb="$1"
+    local swap_path="${2:-${NPM_SWAPFILE:-/swapfile}}"
+
+    if [[ -e "${swap_path}" ]]; then
+        warn "Swap target ${swap_path} already exists ${G_DASH} refusing to overwrite. Set NPM_SWAPFILE to a different path."
+        return 1
+    fi
+
+    info "Allocating ${size_mb} MB swap file at ${swap_path}..."
+    if fallocate -l "${size_mb}M" "${swap_path}" 2>/dev/null; then
+        :
+    else
+        warn "fallocate failed (filesystem may not support it); falling back to dd..."
+        if ! dd if=/dev/zero of="${swap_path}" bs=1M count="${size_mb}" status=none 2>/dev/null; then
+            warn "Could not allocate ${size_mb} MB at ${swap_path} ${G_DASH} disk full?"
+            rm -f "${swap_path}" 2>/dev/null
+            return 1
+        fi
+    fi
+
+    chmod 600 "${swap_path}"
+    if ! mkswap "${swap_path}" &>/dev/null; then
+        warn "mkswap failed on ${swap_path}"
+        rm -f "${swap_path}"
+        return 1
+    fi
+    if ! swapon "${swap_path}" 2>/dev/null; then
+        warn "swapon failed on ${swap_path}"
+        rm -f "${swap_path}"
+        return 1
+    fi
+    log "Swap file ${swap_path} (${size_mb} MB) created and activated."
+    _CREATED_SWAP="${swap_path}"
+    _CREATED_SWAP_SIZE="${size_mb}"
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # >>> SECTION: _resolve_npm_version >>>
 _resolve_npm_version() {
@@ -311,17 +361,55 @@ echo -e "  ${CYAN}Service   :${NC} ${NPM_SERVICE}"
 echo -e "  ${CYAN}Memory    :${NC} ${_TOTAL_RAM_MB} MB   ${CYAN}Minimum   :${NC} ${BOLD}2048 MB (2 GB)${NC}"
 echo ""
 if [[ "${_TOTAL_RAM_MB}" -gt 0 && "${_TOTAL_RAM_MB}" -lt 2048 ]]; then
+    # v1.1.19: detect existing swap; offer to auto-create more if needed.
+    _TOTAL_SWAP_MB=$(awk '/SwapTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo "0")
+    _RAM_GAP=$(( 2048 - _TOTAL_RAM_MB ))
+    _SWAP_TARGET=$(( 2048 + 512 - _TOTAL_RAM_MB ))
+    [[ ${_SWAP_TARGET} -lt 1024 ]] && _SWAP_TARGET=1024
+
     echo -e "  ${RED}${BOLD}WARNING: This system has ${_TOTAL_RAM_MB} MB RAM.${NC}"
-    echo -e "  ${RED}The frontend build requires at least 2 GB RAM.${NC}"
-    echo -e "  ${RED}The build will likely fail with out-of-memory errors.${NC}"
-    echo -e "  ${YELLOW}Recommendation: Increase RAM to 2 GB or add swap space.${NC}"
+    echo -e "  ${RED}The frontend build requires at least 2 GB of memory${NC} (RAM + swap)."
+    echo -e "  ${DIM}Current swap: ${_TOTAL_SWAP_MB} MB. Gap to 2 GB: ${_RAM_GAP} MB.${NC}"
     echo ""
-    if [[ -t 0 ]]; then
-        read -rp "  Continue anyway? [y/N]: " _RAM_CONFIRM || true
-        [[ "${_RAM_CONFIRM,,}" == "y" || "${_RAM_CONFIRM,,}" == "yes" ]] || { echo ""; echo "  Aborted."; exit 1; }
+
+    NPM_AUTOSWAP="${NPM_AUTOSWAP:-auto}"
+    _SHOULD_CREATE_SWAP=false
+
+    case "${NPM_AUTOSWAP}" in
+        false)
+            : ;;
+        true)
+            _SHOULD_CREATE_SWAP=true ;;
+        auto|*)
+            if [[ "${_TOTAL_SWAP_MB}" -ge "${_RAM_GAP}" ]]; then
+                info "Existing swap (${_TOTAL_SWAP_MB} MB) already covers the gap ${G_DASH} no extra swap needed."
+            elif [[ -t 0 ]]; then
+                echo -e "  ${YELLOW}Recommended:${NC} create ${_SWAP_TARGET} MB swap file at ${NPM_SWAPFILE:-/swapfile} (override path with NPM_SWAPFILE)."
+                read -rp "  Create swap file now? [Y/n]: " _SWAP_CONFIRM || true
+                if [[ ! "${_SWAP_CONFIRM,,}" =~ ^(n|no)$ ]]; then
+                    _SHOULD_CREATE_SWAP=true
+                fi
+            else
+                warn "Non-interactive mode: NOT auto-creating swap. Set NPM_AUTOSWAP=true to force."
+            fi ;;
+    esac
+
+    if ${_SHOULD_CREATE_SWAP}; then
+        if ! _create_swap "${_SWAP_TARGET}"; then
+            warn "Swap creation failed ${G_DASH} build may run out of memory."
+        fi
         echo ""
-    else
-        warn "Low RAM detected (${_TOTAL_RAM_MB} MB) ${G_DASH} build may fail. Use --verbose for details."
+    fi
+
+    # If we still don't have enough memory after the swap step, ask before proceeding.
+    _POST_SWAP_TOTAL=$(( _TOTAL_RAM_MB + $(awk '/SwapTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0) ))
+    if [[ ${_POST_SWAP_TOTAL} -lt 2048 ]]; then
+        warn "Total memory after swap step is still ${_POST_SWAP_TOTAL} MB (< 2 GB). Build may OOM."
+        if [[ -t 0 ]]; then
+            read -rp "  Continue anyway? [y/N]: " _RAM_CONFIRM || true
+            [[ "${_RAM_CONFIRM,,}" == "y" || "${_RAM_CONFIRM,,}" == "yes" ]] || { echo ""; echo "  Aborted."; exit 1; }
+            echo ""
+        fi
     fi
 fi
 
@@ -2642,6 +2730,41 @@ _finalize() {
 # Cleanup build artifacts
 # ---------------------------------------------------------------------------
 vrun rm -rf "${NPM_TMP}"
+
+# v1.1.19: if we created a swap file at preflight, ask whether to keep,
+# persist via /etc/fstab, or remove. Default (pressing Enter or non-tty) =
+# keep it active for this boot only.
+if [[ -n "${_CREATED_SWAP:-}" ]]; then
+    echo ""
+    info "Swap file ${_CREATED_SWAP} (${_CREATED_SWAP_SIZE} MB) was created for this install."
+    if [[ -t 0 ]]; then
+        echo "  Options:"
+        echo "    1) Keep permanently (add to /etc/fstab so it survives reboots)"
+        echo "    2) Remove now (swapoff + rm)"
+        echo "    k) Keep for this boot only (default)"
+        echo ""
+        read -rp "  Choice [1/2/k]: " _SWAP_CHOICE || true
+        case "${_SWAP_CHOICE}" in
+            1)
+                if grep -qE "^${_CREATED_SWAP}[[:space:]]" /etc/fstab 2>/dev/null; then
+                    info "${_CREATED_SWAP} already listed in /etc/fstab"
+                else
+                    echo "${_CREATED_SWAP} none swap sw 0 0" >> /etc/fstab
+                    log "Appended to /etc/fstab ${G_DASH} swap will persist across reboots"
+                fi ;;
+            2)
+                swapoff "${_CREATED_SWAP}" 2>/dev/null && rm -f "${_CREATED_SWAP}" \
+                    && log "Swap removed (${_CREATED_SWAP_SIZE} MB freed)"
+                ;;
+            *)
+                info "Swap stays active until next reboot. To remove later:"
+                info "  sudo swapoff ${_CREATED_SWAP} && sudo rm ${_CREATED_SWAP}"
+                ;;
+        esac
+    else
+        info "Non-interactive mode: swap remains active. Add to /etc/fstab for persistence."
+    fi
+fi
 
 # v1.1.10 (#7): prune old ${NPM_HOME}.bak-* directories after a successful
 # install. Each backup carries node_modules (~400 MB), so unbounded
