@@ -39,7 +39,7 @@ On first launch you will see the NPM setup wizard; the pre-filled defaults are `
 | OS | Debian 12+ or Ubuntu 22.04+ |
 | RAM | 2 GB for the frontend build (installer offers to auto-create a swap file on hosts with less) |
 | Disk free | ~3 GB on `/` and `/opt` during build; ~500 MB after |
-| `python3` | required from the very first step (parses the GitHub releases API, patches vite/tsconfig, formats verify output). Ships with every modern Debian and Ubuntu; installer aborts early with an actionable message if missing |
+| Python3 | required from the very first step (parses the GitHub releases API, patches vite/tsconfig, formats verify output). Ships with every modern Debian and Ubuntu; installer aborts early with an actionable message if missing |
 | Root access | required (systemd unit management, binding ports 80/443, certbot) |
 
 ## Usage
