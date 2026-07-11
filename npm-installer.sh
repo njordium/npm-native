@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.20 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.21 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.1.20 — persistent client_body_temp_path (fixes post-reboot bug):
-#    nginx.conf previously set `client_body_temp_path /tmp/nginx/body`.
-#    On modern Debian/Ubuntu /tmp is tmpfs and is wiped on reboot, so
-#    the directory disappeared and `nginx -t` failed with `mkdir()
-#    "/tmp/nginx/body" failed (2: No such file or directory)`. NPM
-#    validates every proxy host save with `nginx -t` internally, so the
-#    UI returned a generic "Internal Error" on every save attempt after
-#    reboot until the directory was manually recreated. The temp path
-#    now lives at /var/lib/nginx/body -- nginx's own state directory,
-#    persistent on the root filesystem. Created once at install time
-#    with www-data ownership; no longer referenced by the systemd
-#    ExecStartPre.
+#  v1.1.21 — fix upstream changelog fetch (was never actually shown):
+#    The version-jump prompt was supposed to display the top of the
+#    upstream release notes before asking the operator to proceed. Two
+#    bugs made this both silent AND crash-prone: (1) the `printf ... |
+#    python3 - <<PYCHANGE` pipeline collided with itself -- Python was
+#    reading its script from the heredoc, so _REL_BODY was never
+#    consumed and every install saw "no Changes section found"; (2) if
+#    the API returned non-JSON (rate limit HTML, empty), Python called
+#    sys.exit(0), closing the pipe, and printf got SIGPIPE (exit 141),
+#    which under set -Eeuo pipefail tripped the ERR trap and aborted
+#    the whole install. Fix: pass _REL_BODY as argv[1] instead of via
+#    stdin. No pipeline, no heredoc conflict, no SIGPIPE, and the
+#    changelog actually renders now. Also replaced the literal
+#    `${G_DASH}` in the fallback message (single-quoted heredoc,
+#    variables never expanded) with a plain "-".
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -29,7 +32,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.20"           # installer script version
+SCRIPT_VERSION="1.1.21"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -986,12 +989,21 @@ elif [[ "${INSTALL_MODE}" == "update" ]]; then
                 if [[ -n "${_REL_BODY}" ]]; then
                     echo ""
                     echo -e "  ${BOLD}${CYAN}${G_HBAR}${G_HBAR} Upstream changelog for v${NPM_VERSION} ${G_HBAR}${G_HBAR}${NC}"
-                    printf '%s' "${_REL_BODY}" | python3 - << 'PYCHANGE'
+                    # v1.1.21: pass body as argv[1], not stdin. The old
+                    # `printf | python3 - <<HEREDOC` pattern collided --
+                    # Python read its script from the heredoc, so the
+                    # piped body was silently discarded and the fallback
+                    # message fired on every run. When the API returned
+                    # non-JSON, Python called sys.exit(0), closing the
+                    # pipe, and printf got SIGPIPE (exit 141), which the
+                    # ERR trap turned into a script abort.
+                    python3 - "${_REL_BODY}" << 'PYCHANGE' || true
 import sys, json, re
+raw = sys.argv[1] if len(sys.argv) > 1 else ""
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(raw) if raw.strip() else {}
 except Exception:
-    sys.exit(0)
+    data = {}
 body = data.get("body", "")
 body = re.sub(r'<!--.*?-->', '', body, flags=re.DOTALL)
 body = re.sub(r'!\[.*?\]\(.*?\)', '', body)
@@ -1014,7 +1026,7 @@ for l in lines:
 for l in out:
     print("    " + l)
 if not out:
-    print("    (no Changes section found in release body ${G_DASH} see URL below)")
+    print("    (no Changes section found in release body - see URL below)")
 PYCHANGE
                     echo ""
                     echo -e "  ${DIM}Full notes: ${_REL_URL}${NC}"
