@@ -1,6 +1,7 @@
 **A native Bash installer for [Nginx Proxy Manager](https://nginxproxymanager.com/) on Debian and Ubuntu -- no Docker required.**
 
-<img width="945" height="767" alt="native-npm-installer" src="https://github.com/user-attachments/assets/a9a28be8-9a37-464f-a889-b8c137efca33" />
+<img width="736" height="639" alt="Screenshot2026-07-11 at 22 19 08" src="https://github.com/user-attachments/assets/cc11f38d-21b4-4e8d-9318-1e0ba3f3eb8e" />
+
 
 ## Why this exists
 
