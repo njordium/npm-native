@@ -1,6 +1,6 @@
 **A native Bash installer for [Nginx Proxy Manager](https://nginxproxymanager.com/) on Debian and Ubuntu -- no Docker required.**
 
-<img width="811" height="635" alt="Screenshot2026-06-24 at 18 41 04" src="https://github.com/user-attachments/assets/1a046b53-6400-4ca7-95e3-8f745a8e904f" />
+<img width="945" height="767" alt="native-npm-installer" src="https://github.com/user-attachments/assets/a9a28be8-9a37-464f-a889-b8c137efca33" />
 
 ## Why this exists
 
@@ -37,8 +37,10 @@ On first launch you will see the NPM setup wizard; the pre-filled defaults are `
 | Requirement | Minimum |
 | ----------- | --------------------------- |
 | OS | Debian 12+ or Ubuntu 22.04+ |
-| RAM | 2 GB (required for frontend build) |
+| RAM | 2 GB for the frontend build (installer offers to auto-create a swap file on hosts with less) |
 | Disk free | ~3 GB on `/` and `/opt` during build; ~500 MB after |
+| `python3` | required from the very first step (parses the GitHub releases API, patches vite/tsconfig, formats verify output). Ships with every modern Debian and Ubuntu; installer aborts early with an actionable message if missing |
+| Root access | required (systemd unit management, binding ports 80/443, certbot) |
 
 ## Usage
 
