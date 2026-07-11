@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.21 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.22 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.1.21 — fix upstream changelog fetch (was never actually shown):
-#    The version-jump prompt was supposed to display the top of the
-#    upstream release notes before asking the operator to proceed. Two
-#    bugs made this both silent AND crash-prone: (1) the `printf ... |
-#    python3 - <<PYCHANGE` pipeline collided with itself -- Python was
-#    reading its script from the heredoc, so _REL_BODY was never
-#    consumed and every install saw "no Changes section found"; (2) if
-#    the API returned non-JSON (rate limit HTML, empty), Python called
-#    sys.exit(0), closing the pipe, and printf got SIGPIPE (exit 141),
-#    which under set -Eeuo pipefail tripped the ERR trap and aborted
-#    the whole install. Fix: pass _REL_BODY as argv[1] instead of via
-#    stdin. No pipeline, no heredoc conflict, no SIGPIPE, and the
-#    changelog actually renders now. Also replaced the literal
-#    `${G_DASH}` in the fallback message (single-quoted heredoc,
-#    variables never expanded) with a plain "-".
+#  v1.1.22 — python3 prerequisite check:
+#    Python 3 is a hard prerequisite for the installer -- it parses JSON
+#    responses from the GitHub API in _resolve_npm_version (which runs
+#    before Step 1 installs anything), patches vite.config.ts and
+#    tsconfig.json during the frontend build, formats the version-jump
+#    changelog, and is used by the verify dashboard. Every modern
+#    Debian and Ubuntu image ships python3 in the base install, but on
+#    a stripped-down container image (or a mis-provisioned host) the
+#    installer used to fail with a cryptic "python3: command not
+#    found" from inside a subshell whose error the ERR trap made even
+#    harder to read. Preflight now checks `command -v python3` early
+#    and dies with a clean actionable message ("Install with:
+#    sudo apt-get install -y python3") if missing.
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -32,7 +30,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.21"           # installer script version
+SCRIPT_VERSION="1.1.22"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -211,6 +209,18 @@ _pnpm_install_with_retry() {
         fi
     done
 }
+
+# ---------------------------------------------------------------------------
+# Hard prerequisite check
+# ---------------------------------------------------------------------------
+# python3 is required from the very first step (_resolve_npm_version parses
+# the GitHub releases API JSON, which runs before Step 1 installs anything).
+# Modern Debian and Ubuntu ship python3 in the base image, but stripped-down
+# containers or mis-provisioned hosts sometimes don't. Fail fast with a clear
+# message rather than crash later with a subshell "command not found".
+if ! command -v python3 &>/dev/null; then
+    die "python3 is required but not installed. Install with: sudo apt-get install -y python3"
+fi
 
 # ---------------------------------------------------------------------------
 # Argument parsing
