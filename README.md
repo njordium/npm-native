@@ -1,7 +1,6 @@
 **A native Bash installer for [Nginx Proxy Manager](https://nginxproxymanager.com/) on Debian and Ubuntu -- no Docker required.**
 
-<img width="767" height="637" alt="Screenshot2026-07-11 at 22 13 02" src="https://github.com/user-attachments/assets/15a2bad5-1f5c-4c1d-9d2b-5a7840b27c2d" />
-
+<img width="945" height="767" alt="native-npm-installer" src="https://github.com/user-attachments/assets/a9a28be8-9a37-464f-a889-b8c137efca33" />
 
 ## Why this exists
 
@@ -38,10 +37,23 @@ On first launch you will see the NPM setup wizard; the pre-filled defaults are `
 | Requirement | Minimum |
 | ----------- | --------------------------- |
 | OS | Debian 12+ or Ubuntu 22.04+ |
-| RAM | 2 GB for the frontend build (installer offers to auto-create a swap file on hosts with less) |
+| RAM | 2 GB for the frontend build; the installer offers to auto-create a swap file on hosts with less (see table below) |
 | Disk free | ~3 GB on `/` and `/opt` during build; ~500 MB after |
-| Python3 | required from the very first step (parses the GitHub releases API, patches vite/tsconfig, formats verify output). Ships with every modern Debian and Ubuntu; installer aborts early with an actionable message if missing |
+| `python3` | required from the very first step (parses the GitHub releases API, patches vite/tsconfig, formats verify output). Ships with every modern Debian and Ubuntu; installer aborts early with an actionable message if missing |
 | Root access | required (systemd unit management, binding ports 80/443, certbot) |
+
+### Notes on RAM
+
+The frontend build (TypeScript compiler + Vite + sass + bundle assembly + minify) is the memory hotspot -- peaks around 1.4-2.4 GB. On hosts with less, the installer offers to create a swap file at preflight so the build completes instead of getting OOM-killed. Behaviour by RAM tier:
+
+| RAM available | What the installer does | Expected build time |
+| --- | --- | --- |
+| >= 2 GB | No prompts, no swap changes | ~10 seconds |
+| 1 GB | Offers to create a 1.5 GB swap file at `/swapfile` | 5-10 minutes |
+| 512 MB | Offers to create a 2 GB swap file | 15-30 minutes (disk-bound) |
+| < 512 MB | Same offer, but not recommended -- build works but is very slow |
+
+Override the auto-swap behaviour with `NPM_AUTOSWAP=true|false|auto` (default `auto`), or set `NPM_SWAPFILE=/path` to place the file somewhere other than `/swapfile`. After a successful install, the operator can keep the swap for this boot only (default), persist it via `/etc/fstab`, or remove it.
 
 ## Usage
 
