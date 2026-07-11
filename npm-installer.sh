@@ -4,18 +4,18 @@
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.1.19 — auto-swap helper for low-RAM hosts:
-#    The frontend build needs ~2 GB of memory (TypeScript compiler, Vite,
-#    bundle assembly, sass, minify). On a 1 GB host the build was "dog
-#    slow" because the kernel was swap-thrashing without enough swap; on
-#    a 512 MB host it failed outright. When detected RAM < 2 GB and the
-#    existing swap is insufficient to cover the gap, the preflight check
-#    now offers to create /swapfile sized to bring total memory budget to
-#    2.5 GB. fallocate is preferred; falls back to dd on filesystems that
-#    don't support it. At end of install the operator can keep it for
-#    this boot only (default), persist via /etc/fstab, or remove the
-#    swap file. Override with NPM_AUTOSWAP=auto|true|false (default
-#    auto). No prompts and no system changes on hosts with >= 2 GB RAM.
+#  v1.1.20 — persistent client_body_temp_path (fixes post-reboot bug):
+#    nginx.conf previously set `client_body_temp_path /tmp/nginx/body`.
+#    On modern Debian/Ubuntu /tmp is tmpfs and is wiped on reboot, so
+#    the directory disappeared and `nginx -t` failed with `mkdir()
+#    "/tmp/nginx/body" failed (2: No such file or directory)`. NPM
+#    validates every proxy host save with `nginx -t` internally, so the
+#    UI returned a generic "Internal Error" on every save attempt after
+#    reboot until the directory was manually recreated. The temp path
+#    now lives at /var/lib/nginx/body -- nginx's own state directory,
+#    persistent on the root filesystem. Created once at install time
+#    with www-data ownership; no longer referenced by the systemd
+#    ExecStartPre.
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -29,7 +29,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.19"           # installer script version
+SCRIPT_VERSION="1.1.20"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -2275,7 +2275,10 @@ rm -rf /etc/nginx/conf.d/stream
 mkdir -p /etc/nginx/conf.d/include
 mkdir -p /etc/nginx/conf.d/stream
 mkdir -p /etc/nginx/conf
-mkdir -p /tmp/nginx/body
+# v1.1.20: persistent temp path (was /tmp/nginx/body -- wiped on reboot,
+# breaking nginx -t and every NPM "save proxy host" call afterwards).
+mkdir -p /var/lib/nginx/body
+chown www-data:www-data /var/lib/nginx/body 2>/dev/null || true
 mkdir -p /data/logs
 mkdir -p /data/letsencrypt-acme-challenge/.well-known/acme-challenge
 mkdir -p /tmp/letsencrypt-lib
@@ -2339,7 +2342,7 @@ http {
     types_hash_max_size 2048;
     server_names_hash_bucket_size 1024;
 
-    client_body_temp_path /tmp/nginx/body 1 2;
+    client_body_temp_path /var/lib/nginx/body 1 2;
     proxy_http_version 1.1;
     proxy_set_header X-Forwarded-Scheme $scheme;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -2609,7 +2612,9 @@ Environment=NGINX_BINARY=/usr/sbin/nginx
 # Ensure required runtime directories exist before starting
 # /tmp/letsencrypt-lib  → certbot --work-dir (REQUIRED: certbot will not create it)
 # /data/letsencrypt-acme-challenge → certbot webroot for HTTP-01 ACME challenge
-ExecStartPre=-/bin/mkdir -p /tmp/nginx/body /tmp/letsencrypt-lib /data/letsencrypt-acme-challenge/.well-known/acme-challenge /data/nginx/default_host /data/nginx/default_www /data/access /data/custom_ssl
+# v1.1.20: /tmp/nginx/body removed from ExecStartPre -- client_body_temp_path
+# now lives at /var/lib/nginx/body (persistent), created once at install.
+ExecStartPre=-/bin/mkdir -p /tmp/letsencrypt-lib /data/letsencrypt-acme-challenge/.well-known/acme-challenge /data/nginx/default_host /data/nginx/default_www /data/access /data/custom_ssl
 # Ensure nginx is running when we start — on reboot nginx may start slightly later
 ExecStartPre=-/bin/systemctl start nginx
 ExecStart=/usr/bin/node index.js --abort_on_uncaught_exception --max_old_space_size=250
