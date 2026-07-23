@@ -462,8 +462,8 @@ prechecks_recover_native() {
     # manifest present
     if [[ -f "${staging}/${MANIFEST_FILE}" ]]; then
         local bdate btype
-        bdate=$(grep "^Created" "${staging}/${MANIFEST_FILE}" | cut -d: -f2- | xargs)
-        btype=$(grep "^Backup type" "${staging}/${MANIFEST_FILE}" | cut -d: -f2 | xargs)
+        bdate=$(grep "^Created" "${staging}/${MANIFEST_FILE}" | cut -d: -f2- | xargs || true)
+        btype=$(grep "^Backup type" "${staging}/${MANIFEST_FILE}" | cut -d: -f2 | xargs || true)
         _pok  "Manifest found — type: ${btype}, created: ${bdate}"
         (( pass++ )) || true
     else
@@ -987,11 +987,11 @@ detect_db_config() {
 
     # ── MySQL / MariaDB ───────────────────────────────────────────────────
     local mysql_host mysql_user mysql_name mysql_pass mysql_port
-    mysql_host=$(echo "${envvars}" | grep '^DB_MYSQL_HOST='     | cut -d= -f2- | tr -d '\r')
-    mysql_user=$(echo "${envvars}" | grep '^DB_MYSQL_USER='     | cut -d= -f2- | tr -d '\r')
-    mysql_name=$(echo "${envvars}" | grep '^DB_MYSQL_NAME='     | cut -d= -f2- | tr -d '\r')
-    mysql_pass=$(echo "${envvars}" | grep '^DB_MYSQL_PASSWORD=' | cut -d= -f2- | tr -d '\r')
-    mysql_port=$(echo "${envvars}" | grep '^DB_MYSQL_PORT='     | cut -d= -f2- | tr -d '\r')
+    mysql_host=$(echo "${envvars}" | grep '^DB_MYSQL_HOST='     | cut -d= -f2- | tr -d '\r' || true)
+    mysql_user=$(echo "${envvars}" | grep '^DB_MYSQL_USER='     | cut -d= -f2- | tr -d '\r' || true)
+    mysql_name=$(echo "${envvars}" | grep '^DB_MYSQL_NAME='     | cut -d= -f2- | tr -d '\r' || true)
+    mysql_pass=$(echo "${envvars}" | grep '^DB_MYSQL_PASSWORD=' | cut -d= -f2- | tr -d '\r' || true)
+    mysql_port=$(echo "${envvars}" | grep '^DB_MYSQL_PORT='     | cut -d= -f2- | tr -d '\r' || true)
 
     if [[ -n "${mysql_host}" && -n "${mysql_user}" && -n "${mysql_name}" ]]; then
         DB_ENGINE="mysql"
@@ -1002,11 +1002,11 @@ detect_db_config() {
 
     # ── PostgreSQL ────────────────────────────────────────────────────────
     local pg_host pg_user pg_name pg_pass pg_port
-    pg_host=$(echo "${envvars}" | grep '^DB_POSTGRES_HOST='     | cut -d= -f2- | tr -d '\r')
-    pg_user=$(echo "${envvars}" | grep '^DB_POSTGRES_USER='     | cut -d= -f2- | tr -d '\r')
-    pg_name=$(echo "${envvars}" | grep '^DB_POSTGRES_NAME='     | cut -d= -f2- | tr -d '\r')
-    pg_pass=$(echo "${envvars}" | grep '^DB_POSTGRES_PASSWORD=' | cut -d= -f2- | tr -d '\r')
-    pg_port=$(echo "${envvars}" | grep '^DB_POSTGRES_PORT='     | cut -d= -f2- | tr -d '\r')
+    pg_host=$(echo "${envvars}" | grep '^DB_POSTGRES_HOST='     | cut -d= -f2- | tr -d '\r' || true)
+    pg_user=$(echo "${envvars}" | grep '^DB_POSTGRES_USER='     | cut -d= -f2- | tr -d '\r' || true)
+    pg_name=$(echo "${envvars}" | grep '^DB_POSTGRES_NAME='     | cut -d= -f2- | tr -d '\r' || true)
+    pg_pass=$(echo "${envvars}" | grep '^DB_POSTGRES_PASSWORD=' | cut -d= -f2- | tr -d '\r' || true)
+    pg_port=$(echo "${envvars}" | grep '^DB_POSTGRES_PORT='     | cut -d= -f2- | tr -d '\r' || true)
 
     if [[ -n "${pg_host}" && -n "${pg_user}" && -n "${pg_name}" ]]; then
         DB_ENGINE="postgres"
@@ -1017,7 +1017,7 @@ detect_db_config() {
 
     # ── Custom SQLite path ────────────────────────────────────────────────
     local sqlite_file
-    sqlite_file=$(echo "${envvars}" | grep '^DB_SQLITE_FILE=' | cut -d= -f2- | tr -d '\r')
+    sqlite_file=$(echo "${envvars}" | grep '^DB_SQLITE_FILE=' | cut -d= -f2- | tr -d '\r' || true)
     [[ -n "${sqlite_file}" ]] && DB_SQLITE_PATH="${sqlite_file}"
 
     # ── Fallback: check for mounted NPM config file ───────────────────────
@@ -1159,14 +1159,14 @@ restore_database() {
     [[ -f "${db_meta}" ]] || { _pfail "db-meta.txt missing from archive"; return 1; }
 
     local engine name
-    engine=$(grep '^DB_ENGINE=' "${db_meta}" | cut -d= -f2)
-    name=$(grep '^DB_NAME=' "${db_meta}" | cut -d= -f2)
+    engine=$(grep '^DB_ENGINE=' "${db_meta}" | cut -d= -f2 || true)
+    name=$(grep '^DB_NAME=' "${db_meta}" | cut -d= -f2 || true)
 
     if [[ "${engine}" == "mysql" ]]; then
         local host port user
-        host=$(grep '^DB_HOST=' "${db_meta}" | cut -d= -f2)
-        port=$(grep '^DB_PORT=' "${db_meta}" | cut -d= -f2)
-        user=$(grep '^DB_USER=' "${db_meta}" | cut -d= -f2)
+        host=$(grep '^DB_HOST=' "${db_meta}" | cut -d= -f2 || true)
+        port=$(grep '^DB_PORT=' "${db_meta}" | cut -d= -f2 || true)
+        user=$(grep '^DB_USER=' "${db_meta}" | cut -d= -f2 || true)
 
         local db_pass
         db_pass=$(ask "MySQL password for ${user}@${host}:${port}/${name}" "")
@@ -1188,9 +1188,9 @@ restore_database() {
 
     elif [[ "${engine}" == "postgres" ]]; then
         local host port user
-        host=$(grep '^DB_HOST=' "${db_meta}" | cut -d= -f2)
-        port=$(grep '^DB_PORT=' "${db_meta}" | cut -d= -f2)
-        user=$(grep '^DB_USER=' "${db_meta}" | cut -d= -f2)
+        host=$(grep '^DB_HOST=' "${db_meta}" | cut -d= -f2 || true)
+        port=$(grep '^DB_PORT=' "${db_meta}" | cut -d= -f2 || true)
+        user=$(grep '^DB_USER=' "${db_meta}" | cut -d= -f2 || true)
 
         local db_pass
         db_pass=$(ask "PostgreSQL password for ${user}@${host}:${port}/${name}" "")
