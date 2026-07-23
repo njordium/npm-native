@@ -652,7 +652,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
 
     # Admin UI (nginx serves React SPA)
     _UI_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null || echo "000")
-    _UI_CT=$(curl -s -I --max-time 4 "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null | grep -i "^content-type" | tr -d '\r' | head -1)
+    _UI_CT=$(curl -s -I --max-time 4 "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null | grep -i "^content-type" | tr -d '\r' | head -1 || true)
     if [[ "${_UI_HTTP}" =~ ^[23] ]]; then
         _pok  "admin UI             http://${HOST_IP}:${ADMIN_PORT}/ -> HTTP ${_UI_HTTP}"
     else
@@ -742,7 +742,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
 
     # Certbot virtualenv — required for DNS challenge certificate requests
     if [[ -f "/opt/certbot/bin/activate" ]]; then
-        _CB_VER=$(/opt/certbot/bin/certbot --version 2>&1 | grep -oP '[\d.]+' | head -1)
+        _CB_VER=$(/opt/certbot/bin/certbot --version 2>&1 | grep -oP '[\d.]+' | head -1 || true)
         _pok  "certbot venv         /opt/certbot (v${_CB_VER}) ${G_DASH} DNS plugins will install correctly"
     else
         _pfail "certbot venv         /opt/certbot MISSING ${G_DASH} DNS challenge cert requests will fail"
@@ -794,7 +794,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
 
     # Database integrity + row counts (only if DB exists)
     if [[ -f "${NPM_DATA}/database.sqlite" ]]; then
-        _INTEG=$(sqlite3 "${NPM_DATA}/database.sqlite" "PRAGMA integrity_check" 2>/dev/null | head -1)
+        _INTEG=$(sqlite3 "${NPM_DATA}/database.sqlite" "PRAGMA integrity_check" 2>/dev/null | head -1 || true)
         if [[ "${_INTEG}" == "ok" ]]; then
             _pok "database integrity  PRAGMA integrity_check = ok"
         else
@@ -1884,8 +1884,13 @@ PYHTTP2
     # whole-line bare `http2 on;` / `http2 off;` directives are stripped —
     # legacy `listen 443 ssl http2;` syntax is preserved.
     if [[ -d "${NPM_DATA}/nginx" ]]; then
-        _STALE_COUNT=$(grep -rlE '^[[:space:]]*http2[[:space:]]+(on|off);[[:space:]]*$' \
-            "${NPM_DATA}/nginx" 2>/dev/null | wc -l)
+        # grep exits 1 when nothing matches, which is the normal case on a
+        # clean install. Under `set -Eeuo pipefail` that exit code propagates
+        # through the pipe and aborts the script. The braces contain the
+        # failure so `wc -l` can report zero. See the same caveat noted in
+        # _show_splash_and_preflight above.
+        _STALE_COUNT=$( { grep -rlE '^[[:space:]]*http2[[:space:]]+(on|off);[[:space:]]*$' \
+            "${NPM_DATA}/nginx" 2>/dev/null || true; } | wc -l)
         if [[ "${_STALE_COUNT}" -gt 0 ]]; then
             warn "Stripping bare http2 directives from ${_STALE_COUNT} existing ${NPM_DATA}/nginx/**/*.conf file(s)"
             find "${NPM_DATA}/nginx" -name '*.conf' -exec \
