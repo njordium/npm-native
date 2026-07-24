@@ -1,22 +1,31 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.22 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.19 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.1.22 — python3 prerequisite check:
-#    Python 3 is a hard prerequisite for the installer -- it parses JSON
-#    responses from the GitHub API in _resolve_npm_version (which runs
-#    before Step 1 installs anything), patches vite.config.ts and
-#    tsconfig.json during the frontend build, formats the version-jump
-#    changelog, and is used by the verify dashboard. Every modern
-#    Debian and Ubuntu image ships python3 in the base install, but on
-#    a stripped-down container image (or a mis-provisioned host) the
-#    installer used to fail with a cryptic "python3: command not
-#    found" from inside a subshell whose error the ERR trap made even
-#    harder to read. Preflight now checks `command -v python3` early
-#    and dies with a clean actionable message ("Install with:
-#    sudo apt-get install -y python3") if missing.
+#  v1.1.23 — guard grep exit code 1 against pipefail (thanks @gobrrrme, PR #6):
+#    grep exits with status 1 when it finds nothing -- normal behaviour, not
+#    an error. Under `set -Eeuo pipefail` that status propagates through the
+#    pipeline and aborts the script. Six call sites left unguarded were
+#    silently killing the installer:
+#
+#      * _step5_install_backend line 1887 (_STALE_COUNT stale-http2 sweep):
+#        every --update on Debian 12 aborted deterministically mid-install,
+#        after moving the previous install to .bak-* but before pnpm install
+#        ran. Left the host with a half-installed tree, no systemd unit,
+#        and no working service. Introduced in v1.1.9.
+#      * _run_verify_mode lines 655, 745, 797 (_UI_CT, _CB_VER, _INTEG):
+#        the verify tool aborted exactly when the condition it was checking
+#        for had gone wrong (admin UI down, certbot broken, DB corrupt),
+#        so the _pfail branch that would have reported the problem was
+#        unreachable.
+#      * _finalize / diagnostic bundle line 894 (os: PRETTY_NAME lookup)
+#        and Step 2 node-version detection lines 1271, 1296.
+#
+#    Fixes: braces + `|| true` on the pipe-into-wc pattern; trailing
+#    `|| true` (or `|| echo "unknown"` where a fallback string was needed)
+#    on the rest. No behaviour change on the success path.
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -30,7 +39,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.22"           # installer script version
+SCRIPT_VERSION="1.1.23"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -652,7 +661,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
 
     # Admin UI (nginx serves React SPA)
     _UI_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null || echo "000")
-    _UI_CT=$(curl -s -I --max-time 4 "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null | grep -i "^content-type" | tr -d '\r' | head -1)
+    _UI_CT=$(curl -s -I --max-time 4 "http://127.0.0.1:${ADMIN_PORT}/" 2>/dev/null | grep -i "^content-type" | tr -d '\r' | head -1 || true)
     if [[ "${_UI_HTTP}" =~ ^[23] ]]; then
         _pok  "admin UI             http://${HOST_IP}:${ADMIN_PORT}/ -> HTTP ${_UI_HTTP}"
     else
@@ -742,7 +751,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
 
     # Certbot virtualenv — required for DNS challenge certificate requests
     if [[ -f "/opt/certbot/bin/activate" ]]; then
-        _CB_VER=$(/opt/certbot/bin/certbot --version 2>&1 | grep -oP '[\d.]+' | head -1)
+        _CB_VER=$(/opt/certbot/bin/certbot --version 2>&1 | grep -oP '[\d.]+' | head -1 || true)
         _pok  "certbot venv         /opt/certbot (v${_CB_VER}) ${G_DASH} DNS plugins will install correctly"
     else
         _pfail "certbot venv         /opt/certbot MISSING ${G_DASH} DNS challenge cert requests will fail"
@@ -794,7 +803,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
 
     # Database integrity + row counts (only if DB exists)
     if [[ -f "${NPM_DATA}/database.sqlite" ]]; then
-        _INTEG=$(sqlite3 "${NPM_DATA}/database.sqlite" "PRAGMA integrity_check" 2>/dev/null | head -1)
+        _INTEG=$(sqlite3 "${NPM_DATA}/database.sqlite" "PRAGMA integrity_check" 2>/dev/null | head -1 || true)
         if [[ "${_INTEG}" == "ok" ]]; then
             _pok "database integrity  PRAGMA integrity_check = ok"
         else
@@ -891,7 +900,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
                 echo "nginx: $(nginx -v 2>&1 | head -1)"
                 echo "certbot: $(/opt/certbot/bin/certbot --version 2>&1 | head -1)"
                 echo "kernel: $(uname -a)"
-                echo "os: $(grep PRETTY_NAME /etc/os-release | cut -d= -f2- | tr -d '\"')"
+                echo "os: $(grep PRETTY_NAME /etc/os-release | cut -d= -f2- | tr -d '\"' || echo unknown)"
                 echo "ts: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
             } > "${_DIAG_TMP}/system-info.txt"
             if tar -czf "${_DIAG_DEST}" -C "${_DIAG_TMP}" . 2>/dev/null; then
@@ -1268,7 +1277,7 @@ step "Step 2/7 ${G_DASH} Installing Node.js ${NODE_MAJOR} LTS"
 # npm alongside it. We always prefer nodesource to get both node + npm together.
 _NEED_NODE=true
 if command -v node &>/dev/null; then
-    EXISTING_NODE=$(node --version 2>/dev/null | grep -oP '\d+' | head -1)
+    EXISTING_NODE=$(node --version 2>/dev/null | grep -oP '\d+' | head -1 || true)
     if [[ "${EXISTING_NODE}" -ge "${NODE_MAJOR}" ]]; then
         log "Node.js $(node --version) already installed ${G_DASH} skipping."
         _NEED_NODE=false
@@ -1293,7 +1302,7 @@ if ${_NEED_NODE}; then
     fi
 
     # Verify we got the right Node.js version
-    _INSTALLED=$(node --version 2>/dev/null | grep -oP '\d+' | head -1)
+    _INSTALLED=$(node --version 2>/dev/null | grep -oP '\d+' | head -1 || true)
     if [[ -n "${_INSTALLED}" && "${_INSTALLED}" -ge "${NODE_MAJOR}" ]]; then
         log "Node.js $(node --version) installed."
     else
@@ -1884,8 +1893,12 @@ PYHTTP2
     # whole-line bare `http2 on;` / `http2 off;` directives are stripped —
     # legacy `listen 443 ssl http2;` syntax is preserved.
     if [[ -d "${NPM_DATA}/nginx" ]]; then
-        _STALE_COUNT=$(grep -rlE '^[[:space:]]*http2[[:space:]]+(on|off);[[:space:]]*$' \
-            "${NPM_DATA}/nginx" 2>/dev/null | wc -l)
+        # v1.1.23 (PR #6): brace group + || true. grep exits 1 when it
+        # finds nothing (the clean-install case), which under pipefail was
+        # killing the whole install right after the previous /opt/... tree
+        # had been moved to .bak-* but before pnpm install ran.
+        _STALE_COUNT=$( { grep -rlE '^[[:space:]]*http2[[:space:]]+(on|off);[[:space:]]*$' \
+            "${NPM_DATA}/nginx" 2>/dev/null || true; } | wc -l)
         if [[ "${_STALE_COUNT}" -gt 0 ]]; then
             warn "Stripping bare http2 directives from ${_STALE_COUNT} existing ${NPM_DATA}/nginx/**/*.conf file(s)"
             find "${NPM_DATA}/nginx" -name '*.conf' -exec \
@@ -2846,3 +2859,4 @@ echo ""
 exec >/dev/null 2>&1
 }  # end _finalize
 _finalize
+
