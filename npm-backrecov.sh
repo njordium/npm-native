@@ -181,7 +181,7 @@ prechecks_backup_native() {
     if [[ -d "${NATIVE_LETSENCRYPT_DIR}/live" ]] && \
        [[ -n "$(ls -A "${NATIVE_LETSENCRYPT_DIR}/live" 2>/dev/null)" ]]; then
         local cert_count
-        cert_count=$(find "${NATIVE_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+        cert_count=$({ find "${NATIVE_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pok  "/etc/letsencrypt/live/ found (${cert_count} certificate(s))"
         (( pass++ )) || true
     elif [[ -d "${NATIVE_LETSENCRYPT_DIR}" ]]; then
@@ -343,7 +343,7 @@ _prechecks_backup_lxc_pve() {
     if [[ -d "${LXC_LETSENCRYPT_DIR}/live" ]] && \
        [[ -n "$(ls -A "${LXC_LETSENCRYPT_DIR}/live" 2>/dev/null)" ]]; then
         local cert_count
-        cert_count=$(find "${LXC_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+        cert_count=$({ find "${LXC_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pok  "/etc/letsencrypt/live/ found (${cert_count} certificate(s))"
         (( pass++ )) || true
     elif [[ -d "${LXC_LETSENCRYPT_DIR}" ]]; then
@@ -511,7 +511,7 @@ prechecks_recover_native() {
     # letsencrypt/ in archive
     if [[ -d "${staging}/${LETSENCRYPT_SUBDIR}" ]]; then
         local cert_count
-        cert_count=$(find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+        cert_count=$({ find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pok  "letsencrypt/ directory in archive (${cert_count} certificate(s))"
         (( pass++ )) || true
     else
@@ -639,7 +639,7 @@ prechecks_backup_docker() {
     # letsencrypt dir
     if [[ -n "${DOCKER_LETSENCRYPT_DIR}" ]] && [[ -d "${DOCKER_LETSENCRYPT_DIR}" ]]; then
         local cert_count
-        cert_count=$(find "${DOCKER_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+        cert_count=$({ find "${DOCKER_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pok  "Let's Encrypt volume exists: ${DOCKER_LETSENCRYPT_DIR} (${cert_count} cert(s))"
         (( pass++ )) || true
     else
@@ -1332,7 +1332,7 @@ backup_native() {
         copy_dir "${NATIVE_LETSENCRYPT_DIR}" "${staging}/${LETSENCRYPT_SUBDIR}"
         local le_size cert_count
         le_size=$(du -sh "${staging}/${LETSENCRYPT_SUBDIR}" | cut -f1)
-        cert_count=$(find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+        cert_count=$({ find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pdone "/etc/letsencrypt/ copied (${le_size})"
         _pok  "${cert_count} certificate(s) verified in archive"
     else
@@ -1591,7 +1591,7 @@ _backup_lxc_or_pve() {
         copy_dir "${LXC_LETSENCRYPT_DIR}" "${staging}/${LETSENCRYPT_SUBDIR}"
         local le_size cert_count
         le_size=$(du -sh "${staging}/${LETSENCRYPT_SUBDIR}" | cut -f1)
-        cert_count=$(find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+        cert_count=$({ find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pdone "/etc/letsencrypt/ copied (${le_size})"
         if [[ "${_type}" == "lxc" ]]; then
             _pok  "${cert_count} certificate(s) verified in archive"
@@ -1840,7 +1840,7 @@ mounts=json.load(sys.stdin)[0].get('Mounts',[])
         copy_dir "${DOCKER_LETSENCRYPT_DIR}" "${staging}/${LETSENCRYPT_SUBDIR}"
         local le_size cert_count
         le_size=$(du -sh "${staging}/${LETSENCRYPT_SUBDIR}" | cut -f1)
-        cert_count=$(find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+        cert_count=$({ find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pdone "Let's Encrypt volume copied (${le_size}, ${cert_count} cert(s))"
         _pok  "Certificate files verified"
     else
@@ -2229,7 +2229,7 @@ recover_docker() {
             cp -a "${staging}/${LETSENCRYPT_SUBDIR}/." "${DOCKER_LETSENCRYPT_DIR}/"
         fi
         local cert_count
-        cert_count=$(find "${DOCKER_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+        cert_count=$({ find "${DOCKER_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pdone "Let's Encrypt volume restored (${cert_count} cert(s))"
     else
         _pskip "Let's Encrypt not in archive or no target path — skipped"

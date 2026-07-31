@@ -195,7 +195,7 @@ do_backup() {
         if copy_dir "${NATIVE_LETSENCRYPT_DIR}" "${staging}/${LETSENCRYPT_SUBDIR}"; then
             local le_size cert_count
             le_size=$(du -sh "${staging}/${LETSENCRYPT_SUBDIR}" | cut -f1)
-            cert_count=$(find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+            cert_count=$({ find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
             _pdone "/etc/letsencrypt/ copied (${le_size}, ${cert_count} cert(s))"
         else
             _pwarn "/etc/letsencrypt/ copy failed — directory will not be in backup"
@@ -326,7 +326,7 @@ do_recover() {
 
     if [[ -d "${staging}/${LETSENCRYPT_SUBDIR}" ]]; then
         local cert_count
-        cert_count=$(find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+        cert_count=$({ find "${staging}/${LETSENCRYPT_SUBDIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pok  "letsencrypt/ present (${cert_count} cert(s))"; (( pass++ )) || true
     else
         _pwarn "letsencrypt/ not in archive — SSL certs will not be restored"; (( warn++ )) || true
@@ -399,7 +399,7 @@ do_recover() {
             cp -a "${staging}/${LETSENCRYPT_SUBDIR}/." "${NATIVE_LETSENCRYPT_DIR}/"
         fi
         local cert_count
-        cert_count=$(find "${NATIVE_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true | wc -l)
+        cert_count=$({ find "${NATIVE_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pdone "/etc/letsencrypt/ restored (${cert_count} cert(s))"
     else
         _pskip "letsencrypt/ not in archive — skipped"
