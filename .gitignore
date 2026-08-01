@@ -1,0 +1,14 @@
+# Local rollback history from iterative development -- kept on disk for
+# safety but not tracked in the repo.
+npm-installer-v*.sh
+npm-installer_*.sh
+
+# Draft replies for GitHub issues and PRs (paste-into-web-UI files).
+github-replies-*.md
+pr*-response.md
+
+# macOS / editor noise.
+.DS_Store
+*.swp
+*.swo
+*~
