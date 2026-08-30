@@ -4,25 +4,32 @@
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.1.24 — certbot plugin install fixes (issues #8, #9):
-#    Two packaging gaps in the certbot / Python side of a native install,
-#    both reported by the community:
+#  v1.1.25 — tsconfig parser + pnpm store efficiency:
+#    Two long-standing problems surfaced by reading a full verbose install
+#    log end to end.
 #
-#    #8 (@erenoglu) -- DNS-challenge plugin installs failed with
-#       "Invalid requirement: 'acme==undefined'". NPM's lib/certbot.js
-#       substitutes process.env.CERTBOT_VERSION into the pip install line
-#       for each plugin's pinned dependencies. The upstream Docker image
-#       sets that variable at build time; our systemd unit did not, so
-#       JavaScript stringified undefined and pip rejected the requirement.
-#       The installer now captures the certbot version when it builds the
-#       /opt/certbot venv and writes Environment=CERTBOT_VERSION=X.Y.Z into
-#       the unit (omitted entirely if detection fails, so an empty value
-#       can never produce a broken "acme==" pin).
+#    * The tsconfig.json JSONC parser stripped // line comments but
+#      deliberately not /* block comments */, because a naive regex would
+#      corrupt glob patterns such as **/*.test.ts. Upstream's tsconfig.json
+#      carries a "/* Bundler mode */" comment on line 15, so the parse failed
+#      on EVERY run and the patch silently fell through to its last-resort
+#      branch, deleting the test files from the source tree instead of adding
+#      exclude entries. The regex for // comments had the mirror-image flaw:
+#      it would have eaten any https:// URL inside a string value. Replaced
+#      with a small string-aware scanner that only treats // and /* as comment
+#      markers when they appear outside a double-quoted string, so globs,
+#      URLs and escaped quotes all survive.
 #
-#    #9 (@khpartusch) -- pip builds inside /opt/certbot could fail with a
-#       confusing "cannot access /dev/null" when no prebuilt wheel was
-#       available for the platform, because Python.h was missing.
-#       python3-dev added to the Step 1 package list.
+#    * The unconditional "pnpm store prune --force" before the frontend
+#      install was pruning the store pnpm had just chosen for the freshly
+#      cloned tree. With no node_modules present yet every entry counted as
+#      unreferenced, so the prune emptied the store and the install that
+#      followed re-downloaded all ~354 packages every single time. Observed
+#      as "reused 0, downloaded 354" for the frontend against "reused 330,
+#      downloaded 37" for the backend in the same run. The prune only ever
+#      existed to clear a corrupted store, and the build-retry path already
+#      does exactly that when a build actually fails, so the unconditional
+#      copy is removed and the targeted one kept.
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -36,7 +43,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.24"           # installer script version
+SCRIPT_VERSION="1.1.25"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -1502,26 +1509,25 @@ YAML_FE
 info "wrote frontend/pnpm-workspace.yaml (allowBuilds for pnpm v11+, onlyBuiltDependencies for v10)"
 
 # ---------------------------------------------------------------------------
-# Clean pnpm store before install
-#
-# Root cause of vite build hang on re-runs: pnpm uses a global
-# content-addressable store (~/.local/share/pnpm/store) that persists across
-# installer runs. A previous aborted install can leave partial or corrupted
-# package entries in the store. When the new node_modules hard-links to those
-# entries, vite hangs mid-transform reading an incomplete module file.
-#
-# Fix: prune orphaned packages from the store, then verify store integrity.
-# This is a no-op on a clean machine (nothing to prune), and automatically
-# detects and re-fetches any corrupted entries on a re-run machine.
+# pnpm store note (v1.1.25)
 # ---------------------------------------------------------------------------
-info "Pruning pnpm store (removes orphaned packages from previous runs)..."
-pnpm store prune --force 2>/dev/null || true
-# pnpm store has no `verify` subcommand (only add/path/prune/status). The
-# `prune --force` above already removed orphaned and alien entries — that's
-# all the integrity protection pnpm itself offers. Previous revision called
-# `pnpm store verify`, which always exited non-zero and triggered a misleading
-# warning. Reported in #5.
-info "pnpm store: pruned"
+# Earlier revisions ran "pnpm store prune --force" here to clear partial or
+# corrupted entries left by an aborted install, which could otherwise make
+# vite hang mid-transform on an incomplete module file.
+#
+# That prune has been removed. pnpm picks a content-addressable store on the
+# same filesystem as the project so it can hard-link, which for the freshly
+# cloned tree under ${NPM_TMP} is NOT the default ~/.local/share/pnpm/store.
+# With no node_modules present yet, every entry in that store counts as
+# unreferenced, so the prune emptied it and the install immediately below
+# re-downloaded every package. A verbose run showed the cost plainly:
+# "reused 0, downloaded 354" for the frontend against "reused 330,
+# downloaded 37" for the backend in the same install.
+#
+# The corrupted-store case is still handled: the build-retry path further
+# down prunes and force-reinstalls when a build actually fails, which is the
+# only situation where the prune was ever earning its keep.
+# ---------------------------------------------------------------------------
 
 # v1.1.13: pnpm fetch resilience.
 # registry.npmjs.org occasionally serves metadata requests that take longer
@@ -1678,13 +1684,53 @@ with open(path) as f:
     raw = f.read()
 
 def parse_jsonc(text):
-    # Strip // line comments (safe: cannot appear inside string values)
-    text = re.sub(r'//[^\n]*', '', text)
+    """Strip JSONC comments without touching anything inside string values.
+
+    v1.1.25: a regex cannot do this correctly. '//' appears inside URLs and
+    '/*' appears inside glob patterns such as '**/*.test.ts', so a naive
+    pattern either corrupts real data or (as before) has to skip block
+    comments entirely and fail on upstream's "/* Bundler mode */" line.
+    Scan character by character instead and only treat comment markers as
+    comments when we are outside a double-quoted string.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if c == '\\' and i + 1 < n:      # keep escape pairs intact
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+        # outside a string
+        if c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '/':
+            while i < n and text[i] != '\n':
+                i += 1
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '*':
+            i += 2
+            while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
+                i += 1
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    stripped = ''.join(out)
     # Remove trailing commas before ] or } (JSONC feature json.loads rejects)
-    # NOTE: no /* */ block comment stripping — the regex would corrupt
-    # glob patterns like **/*.test.ts (misidentified as block comments)
-    text = re.sub(r',(\s*[}\]])', r'\1', text)
-    return json.loads(text)
+    stripped = re.sub(r',(\s*[}\]])', r'\1', stripped)
+    return json.loads(stripped)
 
 patched = False
 try:

@@ -2069,7 +2069,13 @@ recover_native() {
             cp -a "${staging}/${LETSENCRYPT_SUBDIR}/." "${NATIVE_LETSENCRYPT_DIR}/"
         fi
         local cert_count
-        cert_count=$(find "${NATIVE_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null | wc -l)
+        # v1.1.25: /etc/letsencrypt/live only exists if the archive actually
+        # carried issued certificates. An archive where certbot was installed
+        # but no cert was ever issued has accounts/ and renewal/ but no live/,
+        # so find exits 1, pipefail propagates it and set -e killed the restore
+        # partway through. The surrounding [[ -d ]] test checks the STAGING
+        # directory, not this one.
+        cert_count=$( { find "${NATIVE_LETSENCRYPT_DIR}/live" -name "fullchain.pem" 2>/dev/null || true; } | wc -l)
         _pdone "/etc/letsencrypt/ restored"
         _pok  "${cert_count} certificate(s) restored"
     else
