@@ -4,28 +4,25 @@
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.1.23 — guard grep exit code 1 against pipefail (thanks @gobrrrme, PR #6):
-#    grep exits with status 1 when it finds nothing -- normal behaviour, not
-#    an error. Under `set -Eeuo pipefail` that status propagates through the
-#    pipeline and aborts the script. Six call sites left unguarded were
-#    silently killing the installer:
+#  v1.1.24 — certbot plugin install fixes (issues #8, #9):
+#    Two packaging gaps in the certbot / Python side of a native install,
+#    both reported by the community:
 #
-#      * _step5_install_backend line 1887 (_STALE_COUNT stale-http2 sweep):
-#        every --update on Debian 12 aborted deterministically mid-install,
-#        after moving the previous install to .bak-* but before pnpm install
-#        ran. Left the host with a half-installed tree, no systemd unit,
-#        and no working service. Introduced in v1.1.9.
-#      * _run_verify_mode lines 655, 745, 797 (_UI_CT, _CB_VER, _INTEG):
-#        the verify tool aborted exactly when the condition it was checking
-#        for had gone wrong (admin UI down, certbot broken, DB corrupt),
-#        so the _pfail branch that would have reported the problem was
-#        unreachable.
-#      * _finalize / diagnostic bundle line 894 (os: PRETTY_NAME lookup)
-#        and Step 2 node-version detection lines 1271, 1296.
+#    #8 (@erenoglu) -- DNS-challenge plugin installs failed with
+#       "Invalid requirement: 'acme==undefined'". NPM's lib/certbot.js
+#       substitutes process.env.CERTBOT_VERSION into the pip install line
+#       for each plugin's pinned dependencies. The upstream Docker image
+#       sets that variable at build time; our systemd unit did not, so
+#       JavaScript stringified undefined and pip rejected the requirement.
+#       The installer now captures the certbot version when it builds the
+#       /opt/certbot venv and writes Environment=CERTBOT_VERSION=X.Y.Z into
+#       the unit (omitted entirely if detection fails, so an empty value
+#       can never produce a broken "acme==" pin).
 #
-#    Fixes: braces + `|| true` on the pipe-into-wc pattern; trailing
-#    `|| true` (or `|| echo "unknown"` where a fallback string was needed)
-#    on the rest. No behaviour change on the success path.
+#    #9 (@khpartusch) -- pip builds inside /opt/certbot could fail with a
+#       confusing "cannot access /dev/null" when no prebuilt wheel was
+#       available for the platform, because Python.h was missing.
+#       python3-dev added to the Step 1 package list.
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -39,7 +36,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.23"           # installer script version
+SCRIPT_VERSION="1.1.24"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -1223,6 +1220,7 @@ vrun apt-get install -y --no-install-recommends \
     apt-transport-https \
     build-essential \
     python3 \
+    python3-dev \
     python3-pip \
     python3-venv \
     openssl \
@@ -1260,7 +1258,21 @@ step "Creating certbot virtualenv at /opt/certbot"
 python3 -m venv /opt/certbot
 vrun /opt/certbot/bin/pip install --quiet --upgrade pip
 vrun /opt/certbot/bin/pip install --quiet certbot
-log "certbot virtualenv ready: $(/opt/certbot/bin/certbot --version 2>&1)" 
+log "certbot virtualenv ready: $(/opt/certbot/bin/certbot --version 2>&1)"
+
+# v1.1.24 (issue #8): capture the certbot version for the systemd unit.
+# NPM's lib/certbot.js does:
+#   plugin.version = plugin.version.replace(/{{certbot-version}}/g, process.env.CERTBOT_VERSION)
+# for every DNS plugin it installs. With the variable unset, JavaScript
+# substitutes the literal string "undefined" and pip rejects the resulting
+# requirement ("Invalid requirement: 'acme==undefined'"). The Docker image
+# sets CERTBOT_VERSION at build time; a native install has to do it here.
+_CERTBOT_VER=$(/opt/certbot/bin/certbot --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1 || true)
+if [[ -n "${_CERTBOT_VER}" ]]; then
+    info "certbot version detected: ${_CERTBOT_VER} (exported to the service as CERTBOT_VERSION)"
+else
+    warn "Could not detect certbot version ${G_DASH} DNS plugin installs may fail with 'acme==undefined'."
+fi
 
 # ---------------------------------------------------------------------------
 }  # end _step1b_certbot_venv
@@ -2626,6 +2638,16 @@ if [[ "${INSTALL_MODE}" == "update" ]] && [[ -f "/etc/systemd/system/${NPM_SERVI
     warn "Replacing main systemd unit. Drop-ins under ${NPM_SERVICE}.service.d/ are preserved; Environment= / ExecStart= lines added directly to the main unit will be lost."
 fi
 
+# v1.1.24 (issue #8): only emit the CERTBOT_VERSION line when we actually
+# detected a version. An empty value would give pip "acme==" which is just
+# as broken as "acme==undefined", so omitting the line is the safe fallback
+# (NPM then behaves exactly as it did before this fix, rather than worse).
+if [[ -n "${_CERTBOT_VER:-}" ]]; then
+    _CERTBOT_ENV_LINE="Environment=CERTBOT_VERSION=${_CERTBOT_VER}"
+else
+    _CERTBOT_ENV_LINE=""
+fi
+
 cat > "/etc/systemd/system/${NPM_SERVICE}.service" <<SERVICE
 [Unit]
 Description=Nginx Proxy Manager
@@ -2644,6 +2666,12 @@ Environment=SUPPRESS_NO_CONFIG_WARNING=1
 Environment=LD_PRELOAD=
 # Tell the backend where nginx lives so it can reload configs
 Environment=NGINX_BINARY=/usr/sbin/nginx
+# v1.1.24 (issue #8): NPM substitutes this into the pip requirement for
+# every certbot DNS plugin it installs. Unset -> "acme==undefined" -> pip
+# rejects it. Empty -> "acme==" -> pip also rejects it. The line is built
+# above and expands to nothing when detection failed, so a broken pin can
+# never reach the unit.
+${_CERTBOT_ENV_LINE}
 # Ensure required runtime directories exist before starting
 # /tmp/letsencrypt-lib  → certbot --work-dir (REQUIRED: certbot will not create it)
 # /data/letsencrypt-acme-challenge → certbot webroot for HTTP-01 ACME challenge
