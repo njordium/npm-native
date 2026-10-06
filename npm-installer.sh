@@ -277,13 +277,18 @@ _self_update() {
         && mv -f "${self}.new" "${self}"; then
         rm -f "${new}"
         log "Installer updated to v${remote} (previous: ${self}.bak-v${SCRIPT_VERSION})"
-    else
-        self="${new}"
-        warn "Could not replace the script file ${G_DASH} running v${remote} from ${self}"
+        _tmp_cleanup
+        trap - EXIT
+        exec bash "${self}" "$@"
     fi
+    # Not a writable file (e.g. bash <(curl ...)): run the new copy, then remove it
+    warn "Cannot replace the running script ${G_DASH} running v${remote} from a temp copy"
     _tmp_cleanup
     trap - EXIT
-    exec bash "${self}" "$@"
+    local rc=0
+    bash "${new}" "$@" || rc=$?
+    rm -f "${new}"
+    exit "${rc}"
 }
 for _arg in "$@"; do [[ "${_arg}" == "--no-self-update" ]] && NPM_SELF_UPDATE=false; done
 _self_update "$@"
