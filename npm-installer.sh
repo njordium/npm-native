@@ -1,8 +1,37 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.25 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.26 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.1.26 — NPM 2.16.0 update run:
+#    Found by running --update 2.15.1 -> 2.16.0 on a clone of a live proxy.
+#
+#    * The react-intl patch forced "~10.1.0" on every release. It exists for
+#      2.14.0's deprecated ^8 pin, but 2.15.0+ already ship a v10 range and
+#      2.16.0 needs ^10.2.0, so the patch was downgrading a dependency that
+#      upstream had right. It now only applies when upstream pins below v10.
+#
+#    * Locales are compiled from the cloned release with upstream's own
+#      "locale-compile" script (formatjs compile-folder), as upstream CI does.
+#      Previously en.json was downloaded from the develop branch - not the
+#      tag being built, and an empty {} if GitHub was unreachable, which shows
+#      raw message ids across the whole UI - and every other language was an
+#      empty stub. The download/stub path is kept as a fallback only.
+#
+#    * Step 6 rewrites /etc/nginx/nginx.conf. Directives that only existed in
+#      the old file (for example a hand-added log_format) are now listed in a
+#      warning, pointing at __NPM_DATA__/nginx/custom/http.conf, which nginx.conf
+#      includes and updates leave alone.
+#
+#    * Streams never worked: the stream {} block did not include
+#      conf.d/include/log-stream.conf, so the log_format "stream" that every
+#      NPM stream config references (since at least 2.14) was undefined,
+#      nginx -t failed on each stream save, and NPM kept only <id>.conf.err.
+#      Now included as upstream does, plus custom/stream.conf.
+#
+#    * The splash screen's "clear" failed when TERM is unset (cron, nohup,
+#      some CI shells) and the ERR trap aborted the run before preflight.
 #
 #  v1.1.25 — tsconfig parser + pnpm store efficiency:
 #    Two long-standing problems surfaced by reading a full verbose install
@@ -43,7 +72,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.25"           # installer script version
+SCRIPT_VERSION="1.1.26"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -332,7 +361,7 @@ _resolve_npm_version
 _show_splash_and_preflight() {
 # ASCII splash screen
 # ---------------------------------------------------------------------------
-clear
+clear 2>/dev/null || true   # fails without a usable TERM (cron, nohup)
 echo -e "${BOLD}${CYAN}"
 cat << 'SPLASH'
     _   ____  __  ___
@@ -1461,13 +1490,21 @@ info "pnpm $(pnpm --version) ready."
 # is removal of the injectIntl HOC — which NPM does not use.
 # All three APIs are unchanged in v10. Zero source code changes required.
 # Patch BEFORE pnpm install so the resolver picks v10 from the start.
+#
+# v1.1.26: only patch when upstream pins below v10. NPM 2.15.0+ ship a v10
+# range themselves (2.16.0: ^10.2.0), and forcing ~10.1.0 onto those
+# downgraded react-intl below what the release was built and tested against.
 _FRONTEND_PKG="${NPM_TMP}/frontend/package.json"
-if grep -q '"react-intl"' "${_FRONTEND_PKG}" 2>/dev/null; then
+_RI_SPEC=$(jq -r '.dependencies["react-intl"] // empty' "${_FRONTEND_PKG}" 2>/dev/null || true)
+_RI_MAJOR=$(grep -oE '[0-9]+' <<< "${_RI_SPEC}" | head -1 || true)
+if [[ -n "${_RI_MAJOR}" && "${_RI_MAJOR}" -lt 10 ]]; then
     # Pin to a known-good v10 minor — `^10.0.0` would happily resolve to a
     # future v10.x with breaking changes. `~10.1.0` allows patch updates only.
     jq '.dependencies["react-intl"] = "~10.1.0"' "${_FRONTEND_PKG}" \
         > "${_FRONTEND_PKG}.tmp" && mv "${_FRONTEND_PKG}.tmp" "${_FRONTEND_PKG}"
-    info "react-intl patched: ^8.x ${G_ARROW} ~10.1.0 (v9 broken/deprecated; v10 API-compatible)"
+    info "react-intl patched: ${_RI_SPEC} ${G_ARROW} ~10.1.0 (v9 broken/deprecated; v10 API-compatible)"
+elif [[ -n "${_RI_SPEC}" ]]; then
+    info "react-intl: upstream ${_RI_SPEC} kept (already v10+)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1571,12 +1608,30 @@ fi
 #
 # Fix: scan IntlProvider.tsx for all locale imports, and create {} stub
 # files for any that are missing. The UI falls back to English gracefully.
+#
+# v1.1.26: the translation sources ARE in git (frontend/src/locale/src/*.json);
+# only the compiled lang/ output is not. Compile them first with upstream's own
+# "locale-compile" script, exactly as upstream CI does before "yarn build", so
+# every language ships and en.json matches the tag being built. The stub step
+# below then only fills gaps, and is the whole fallback if compiling fails.
 # ---------------------------------------------------------------------------
-info "Checking for missing locale JSON stubs (Crowdin-managed, absent from git)..."
-
 LANG_DIR="${NPM_TMP}/frontend/src/locale/lang"
 INTL_FILE="${NPM_TMP}/frontend/src/locale/IntlProvider.tsx"
 mkdir -p "${LANG_DIR}"
+
+if jq -e '.scripts["locale-compile"]' "${NPM_TMP}/frontend/package.json" &>/dev/null \
+    && [[ -d "${NPM_TMP}/frontend/src/locale/src" ]]; then
+    info "Compiling locales from release source (pnpm run locale-compile)..."
+    if vrun pnpm run locale-compile \
+        && [[ -s "${LANG_DIR}/en.json" && "$(wc -c < "${LANG_DIR}/en.json")" -gt 2 ]]; then
+        info "Locales compiled: $(find "${LANG_DIR}" -maxdepth 1 -name '*.json' | wc -l) files"
+    else
+        warn "locale-compile failed ${G_DASH} falling back to downloaded English + empty stubs"
+        rm -f "${LANG_DIR}"/*.json
+    fi
+fi
+
+info "Checking for missing locale JSON stubs (Crowdin-managed, absent from git)..."
 
 # ---------------------------------------------------------------------------
 # Locale population: 3-phase approach
@@ -1605,7 +1660,11 @@ imports = re.findall(r'from\s+[\'"]./lang/([^\'"]+\.json)[\'"]', src)
 # Phase 1 - English: fetch from upstream and compile to flat format
 en_path = os.path.join(lang_dir, "en.json")
 en_written = False
-if _urllib_ok:
+# v1.1.26: keep an en.json compiled from the release source (locale-compile)
+if os.path.isfile(en_path) and os.path.getsize(en_path) > 2:
+    en_written = True
+    vprint("  en.json: compiled from release source")
+if _urllib_ok and not en_written:
     URL = ("https://raw.githubusercontent.com/NginxProxyManager"
            "/nginx-proxy-manager/develop/frontend/src/locale/src/en.json")
     try:
@@ -2357,6 +2416,16 @@ info "Configuring nginx for NPM (self-contained, no docker/rootfs copies)..."
 dpkg -l libnginx-mod-stream 2>/dev/null | grep -q '^ii' \
     || vrun apt-get install -y --no-install-recommends libnginx-mod-stream -qq
 
+# v1.1.26: remember what is there now, so anything hand-added that the reset
+# and the nginx.conf rewrite below drop can be reported after the rewrite.
+_OLD_NGINX_CONF=$(mktemp /tmp/npm-old-nginx-conf.XXXXXX)
+cp /etc/nginx/nginx.conf "${_OLD_NGINX_CONF}" 2>/dev/null || true
+_OLD_NGINX_FILES=""
+for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
+    [[ -e "${_f}" && "${_f}" != /etc/nginx/sites-enabled/default ]] || continue
+    _OLD_NGINX_FILES+="${_f#/etc/nginx/}"$'\n'
+done
+
 # ── Full reset — wipe all nginx configs to a known-empty state ──────────────
 rm -f  /etc/nginx/sites-enabled/*
 rm -f  /etc/nginx/sites-available/*
@@ -2549,14 +2618,46 @@ http {
 }
 
 # Stream block for TCP/UDP proxying
+# v1.1.26: log-stream.conf defines log_format "stream", which every NPM stream
+# config uses (access_log ... stream;). Without it nginx -t fails on every
+# stream save and NPM leaves only <id>.conf.err - streams never came up.
 stream {
+    include /etc/nginx/conf.d/include/log-stream[.]conf;
     include __NPM_DATA__/nginx/stream/*.conf;
+    include __NPM_DATA__/nginx/custom/stream[.]conf;
 }
 NGINX_CONF
 
 # Replace placeholders with actual paths (keeps heredoc single-quoted to avoid
 # escaping dozens of nginx $ variables)
 sed -i "s|__NPM_HOME__|${NPM_HOME}|g; s|__NPM_DATA__|${NPM_DATA}|g" /etc/nginx/nginx.conf
+
+# v1.1.26: report directives from the previous nginx.conf that the rewrite
+# dropped. They are not carried over automatically (a stale directive can
+# break nginx -t), but they must not vanish silently either.
+if [[ -s "${_OLD_NGINX_CONF}" ]]; then
+    _DROPPED=$(python3 - "${_OLD_NGINX_CONF}" /etc/nginx/nginx.conf <<'PYDROP' || true
+import re, sys
+def lines(path):
+    out = []
+    for l in open(path, errors="replace"):
+        l = re.sub(r"\s+", " ", l.strip())
+        if l and not l.startswith("#") and l not in ("{", "}"):
+            out.append(l)
+    return out
+new = set(lines(sys.argv[2]))
+for l in lines(sys.argv[1]):
+    if l not in new:
+        print("      " + l)
+PYDROP
+)
+    if [[ -n "${_DROPPED}" ]]; then
+        warn "Previous /etc/nginx/nginx.conf had lines the new one does not (backup: ${NGINX_BACKUP:-/var/backups/etc-nginx.bak-*.tar.gz}):"
+        echo "${_DROPPED}"
+        warn "To keep custom http-level directives across updates, put them in ${NPM_DATA}/nginx/custom/http.conf (included by nginx.conf)."
+    fi
+fi
+rm -f "${_OLD_NGINX_CONF}"
 
 # Symlink for tools that expect /etc/nginx/conf/nginx.conf
 ln -sf /etc/nginx/nginx.conf /etc/nginx/conf/nginx.conf 2>/dev/null || true
@@ -2609,6 +2710,16 @@ mkdir -p /var/www/html
     cp -r "${NPM_TMP}/docker/rootfs/var/www/html/"* /var/www/html/ 2>/dev/null || true
 
 # ── Validate and start nginx ──────────────────────────────────────────────────
+# v1.1.26: same report for whole files the reset removed and nothing rewrote
+_GONE_FILES=""
+while IFS= read -r _f; do
+    [[ -n "${_f}" && ! -e "/etc/nginx/${_f}" ]] && _GONE_FILES+="      /etc/nginx/${_f}"$'\n'
+done <<< "${_OLD_NGINX_FILES:-}"
+if [[ -n "${_GONE_FILES}" ]]; then
+    warn "Removed from /etc/nginx and not recreated (backup: ${NGINX_BACKUP:-/var/backups/etc-nginx.bak-*.tar.gz}):"
+    echo -n "${_GONE_FILES}"
+fi
+
 nginx -t &>/dev/null || die "nginx config test failed ${G_DASH} run: nginx -t for details."
 
 # Enable nginx to start on boot and verify the symlink was created
