@@ -4,34 +4,12 @@
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.1.26 — NPM 2.16.0 update run:
-#    Found by running --update 2.15.1 -> 2.16.0 on a clone of a live proxy.
-#
-#    * The react-intl patch forced "~10.1.0" on every release. It exists for
-#      2.14.0's deprecated ^8 pin, but 2.15.0+ already ship a v10 range and
-#      2.16.0 needs ^10.2.0, so the patch was downgrading a dependency that
-#      upstream had right. It now only applies when upstream pins below v10.
-#
-#    * Locales are compiled from the cloned release with upstream's own
-#      "locale-compile" script (formatjs compile-folder), as upstream CI does.
-#      Previously en.json was downloaded from the develop branch - not the
-#      tag being built, and an empty {} if GitHub was unreachable, which shows
-#      raw message ids across the whole UI - and every other language was an
-#      empty stub. The download/stub path is kept as a fallback only.
-#
-#    * Step 6 rewrites /etc/nginx/nginx.conf. Directives that only existed in
-#      the old file (for example a hand-added log_format) are now listed in a
-#      warning, pointing at __NPM_DATA__/nginx/custom/http.conf, which nginx.conf
-#      includes and updates leave alone.
-#
-#    * Streams never worked: the stream {} block did not include
-#      conf.d/include/log-stream.conf, so the log_format "stream" that every
-#      NPM stream config references (since at least 2.14) was undefined,
-#      nginx -t failed on each stream save, and NPM kept only <id>.conf.err.
-#      Now included as upstream does, plus custom/stream.conf.
-#
-#    * The splash screen's "clear" failed when TERM is unset (cron, nohup,
-#      some CI shells) and the ERR trap aborted the run before preflight.
+#  v1.1.26 — NPM 2.16.0 support:
+#    * react-intl pinned to ~10.1.0 only when upstream is below v10.
+#    * Locales compiled from the release (locale-compile); download is fallback.
+#    * Streams: include log-stream.conf (log_format "stream" was undefined).
+#    * Warn about nginx.conf lines/files dropped by the rewrite.
+#    * "clear" no longer aborts when TERM is unset.
 #
 #  v1.1.25 — tsconfig parser + pnpm store efficiency:
 #    Two long-standing problems surfaced by reading a full verbose install
@@ -1490,10 +1468,7 @@ info "pnpm $(pnpm --version) ready."
 # is removal of the injectIntl HOC — which NPM does not use.
 # All three APIs are unchanged in v10. Zero source code changes required.
 # Patch BEFORE pnpm install so the resolver picks v10 from the start.
-#
-# v1.1.26: only patch when upstream pins below v10. NPM 2.15.0+ ship a v10
-# range themselves (2.16.0: ^10.2.0), and forcing ~10.1.0 onto those
-# downgraded react-intl below what the release was built and tested against.
+# v1.1.26: only when upstream is below v10 (2.16.0 needs ^10.2.0).
 _FRONTEND_PKG="${NPM_TMP}/frontend/package.json"
 _RI_SPEC=$(jq -r '.dependencies["react-intl"] // empty' "${_FRONTEND_PKG}" 2>/dev/null || true)
 _RI_MAJOR=$(grep -oE '[0-9]+' <<< "${_RI_SPEC}" | head -1 || true)
@@ -1608,12 +1583,8 @@ fi
 #
 # Fix: scan IntlProvider.tsx for all locale imports, and create {} stub
 # files for any that are missing. The UI falls back to English gracefully.
-#
-# v1.1.26: the translation sources ARE in git (frontend/src/locale/src/*.json);
-# only the compiled lang/ output is not. Compile them first with upstream's own
-# "locale-compile" script, exactly as upstream CI does before "yarn build", so
-# every language ships and en.json matches the tag being built. The stub step
-# below then only fills gaps, and is the whole fallback if compiling fails.
+# v1.1.26: sources are in git (src/locale/src); compile them as upstream CI
+# does. The stub step below is the fallback.
 # ---------------------------------------------------------------------------
 LANG_DIR="${NPM_TMP}/frontend/src/locale/lang"
 INTL_FILE="${NPM_TMP}/frontend/src/locale/IntlProvider.tsx"
@@ -1660,7 +1631,7 @@ imports = re.findall(r'from\s+[\'"]./lang/([^\'"]+\.json)[\'"]', src)
 # Phase 1 - English: fetch from upstream and compile to flat format
 en_path = os.path.join(lang_dir, "en.json")
 en_written = False
-# v1.1.26: keep an en.json compiled from the release source (locale-compile)
+# v1.1.26: keep en.json from locale-compile
 if os.path.isfile(en_path) and os.path.getsize(en_path) > 2:
     en_written = True
     vprint("  en.json: compiled from release source")
@@ -2416,8 +2387,7 @@ info "Configuring nginx for NPM (self-contained, no docker/rootfs copies)..."
 dpkg -l libnginx-mod-stream 2>/dev/null | grep -q '^ii' \
     || vrun apt-get install -y --no-install-recommends libnginx-mod-stream -qq
 
-# v1.1.26: remember what is there now, so anything hand-added that the reset
-# and the nginx.conf rewrite below drop can be reported after the rewrite.
+# v1.1.26: snapshot to report what the reset/rewrite drops
 _OLD_NGINX_CONF=$(mktemp /tmp/npm-old-nginx-conf.XXXXXX)
 cp /etc/nginx/nginx.conf "${_OLD_NGINX_CONF}" 2>/dev/null || true
 _OLD_NGINX_FILES=""
@@ -2618,9 +2588,7 @@ http {
 }
 
 # Stream block for TCP/UDP proxying
-# v1.1.26: log-stream.conf defines log_format "stream", which every NPM stream
-# config uses (access_log ... stream;). Without it nginx -t fails on every
-# stream save and NPM leaves only <id>.conf.err - streams never came up.
+# v1.1.26: log-stream.conf defines log_format "stream" used by stream configs
 stream {
     include /etc/nginx/conf.d/include/log-stream[.]conf;
     include __NPM_DATA__/nginx/stream/*.conf;
@@ -2632,9 +2600,7 @@ NGINX_CONF
 # escaping dozens of nginx $ variables)
 sed -i "s|__NPM_HOME__|${NPM_HOME}|g; s|__NPM_DATA__|${NPM_DATA}|g" /etc/nginx/nginx.conf
 
-# v1.1.26: report directives from the previous nginx.conf that the rewrite
-# dropped. They are not carried over automatically (a stale directive can
-# break nginx -t), but they must not vanish silently either.
+# v1.1.26: warn about dropped nginx.conf lines (not carried over)
 if [[ -s "${_OLD_NGINX_CONF}" ]]; then
     _DROPPED=$(python3 - "${_OLD_NGINX_CONF}" /etc/nginx/nginx.conf <<'PYDROP' || true
 import re, sys
@@ -2710,7 +2676,7 @@ mkdir -p /var/www/html
     cp -r "${NPM_TMP}/docker/rootfs/var/www/html/"* /var/www/html/ 2>/dev/null || true
 
 # ── Validate and start nginx ──────────────────────────────────────────────────
-# v1.1.26: same report for whole files the reset removed and nothing rewrote
+# v1.1.26: warn about removed files that were not recreated
 _GONE_FILES=""
 while IFS= read -r _f; do
     [[ -n "${_f}" && ! -e "/etc/nginx/${_f}" ]] && _GONE_FILES+="      /etc/nginx/${_f}"$'\n'
