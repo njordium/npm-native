@@ -67,6 +67,7 @@ Options:
   --verbose        Show all output from every step (default: quiet)
   --quiet          Show main steps only
   --version <x.y.z>  Pin a specific NPM release (default: latest from GitHub)
+  --no-self-update Skip the check for a newer installer
   --help, -h       Show this help
 
 Examples:
@@ -83,6 +84,7 @@ The script honours a handful of environment overrides for non-interactive or con
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NPM_VERSION` | latest | Pin the NPM release (alternative to `--version`) |
+| `NPM_SELF_UPDATE` | `true` | `false` skips the check for a newer installer on start |
 | `NPM_HOME` | `/opt/nginx-proxy-manager` | Install root |
 | `NPM_DATA` | `/data` | Runtime data (database, proxy configs, logs) |
 | `NPM_USE_UTF8` | `auto` | `true` / `false` / `auto` -- override glyph rendering detection |
