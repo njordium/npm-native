@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.26 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.27 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.1.27 — Offer to update the installer when main has a newer version
+#    (skip with --no-self-update or NPM_SELF_UPDATE=false).
 #
 #  v1.1.26 — NPM 2.16.0 support:
 #    * react-intl pinned to ~10.1.0 only when upstream is below v10.
@@ -50,7 +53,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.26"           # installer script version
+SCRIPT_VERSION="1.1.27"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -243,6 +246,49 @@ if ! command -v python3 &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
+# v1.1.27: self-update check -- offer a newer installer from main, then re-run it
+# ---------------------------------------------------------------------------
+_self_update() {
+    local url="https://raw.githubusercontent.com/njordium/npm-native/main/npm-installer.sh"
+    local new remote self ans=""
+    [[ "${NPM_SELF_UPDATE:-true}" == "false" ]] && return 0
+    new=$(mktemp /tmp/npm-installer-new.XXXXXX.sh) || return 0
+    remote=""
+    if curl -fsSL --max-time 10 -o "${new}" "${url}" 2>/dev/null && bash -n "${new}" 2>/dev/null; then
+        remote=$(grep -m1 -oP '^SCRIPT_VERSION="\K[0-9]+\.[0-9]+\.[0-9]+' "${new}" || true)
+    fi
+    if [[ -z "${remote}" || "${remote}" == "${SCRIPT_VERSION}" \
+        || "$(printf '%s\n' "${SCRIPT_VERSION}" "${remote}" | sort -V | tail -1)" != "${remote}" ]]; then
+        rm -f "${new}"; return 0
+    fi
+    warn "A newer installer is available: v${SCRIPT_VERSION} ${G_ARROW} v${remote}"
+    if [[ ! -t 0 ]]; then
+        warn "Non-interactive ${G_DASH} continuing with v${SCRIPT_VERSION}. Get it from: ${url}"
+        rm -f "${new}"; return 0
+    fi
+    read -rp "  Update the installer and restart it? [Y/n]: " ans || true
+    if [[ "${ans}" =~ ^[Nn] ]]; then
+        rm -f "${new}"; return 0
+    fi
+    self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)
+    if [[ -f "${self}" && -w "$(dirname "${self}")" ]] \
+        && cp -p "${self}" "${self}.bak-v${SCRIPT_VERSION}" \
+        && cp "${new}" "${self}.new" && chmod --reference="${self}" "${self}.new" \
+        && mv -f "${self}.new" "${self}"; then
+        rm -f "${new}"
+        log "Installer updated to v${remote} (previous: ${self}.bak-v${SCRIPT_VERSION})"
+    else
+        self="${new}"
+        warn "Could not replace the script file ${G_DASH} running v${remote} from ${self}"
+    fi
+    _tmp_cleanup
+    trap - EXIT
+    exec bash "${self}" "$@"
+}
+for _arg in "$@"; do [[ "${_arg}" == "--no-self-update" ]] && NPM_SELF_UPDATE=false; done
+_self_update "$@"
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -253,6 +299,7 @@ while [[ $# -gt 0 ]]; do
         --verify)      INSTALL_MODE="verify"; shift ;;
         --verbose)     VERBOSE=true;  shift ;;
         --quiet)       VERBOSE=false; shift ;;
+        --no-self-update) shift ;;
         --help|-h)
             echo "Usage: $0 [--version <x.y.z>] [--fresh|--update|--verify] [--verbose|--quiet]"
             echo "  --fresh    Fresh install (wipes database)"
@@ -260,6 +307,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --verify   Run verification tests only"
             echo "  --verbose  Show all step output"
             echo "  --quiet    Show main steps only (default)"
+            echo "  --no-self-update  Skip the installer update check"
             exit 0 ;;
         *) die "Unknown argument: $1" ;;
     esac
