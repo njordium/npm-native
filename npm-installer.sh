@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.27 (Debian / Ubuntu)
+#  Nginx Proxy Manager — Native Linux Installer v1.1.28 (Debian / Ubuntu)
 #  No Docker  |  SQLite  |  Systemd  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.1.28 — Verify: time sync passes in containers when the host syncs the clock.
 #
 #  v1.1.27 — Offer to update the installer when main has a newer version
 #    (skip with --no-self-update or NPM_SELF_UPDATE=false).
@@ -53,7 +55,7 @@ trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' E
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.27"           # installer script version
+SCRIPT_VERSION="1.1.28"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -863,6 +865,12 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
             break
         fi
     done
+    # v1.1.28: containers get the clock from the host
+    if ! ${_TIMESYNC_ACTIVE} && systemd-detect-virt -cq 2>/dev/null \
+        && [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
+        _pok "time sync           synced by host ($(systemd-detect-virt -c))"
+        _TIMESYNC_ACTIVE=true
+    fi
     ${_TIMESYNC_ACTIVE} || _pwarn "time sync           no chronyd/systemd-timesyncd/ntpd active ${G_DASH} cert validation may fail"
 
     # Database integrity + row counts (only if DB exists)
