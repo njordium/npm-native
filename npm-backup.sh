@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  npm-backup.sh — Nginx Proxy Manager Native Backup & Recovery (Lite)
-#  NPM Native only  |  SQLite  |  Systemd  |  Team Njordium
+#  NPM Native only  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Authors: Kim Haverblad & Tommy Jansson
 #
 #  Usage:
@@ -11,7 +11,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
@@ -54,7 +54,12 @@ section(){ echo -e "\n${BOLD}── $* ──${NC}"; }
 # ---------------------------------------------------------------------------
 timestamp()     { date '+%Y-%m-%d-%H%M%S'; }
 datestamp()     { date '+%Y-%m-%d %H:%M:%S'; }
-native_is_running() { systemctl is-active --quiet "${NATIVE_SERVICE}" 2>/dev/null; }
+# v1.1.0: Alpine uses OpenRC instead of systemd
+_is_alpine()  { grep -qs '^ID=alpine' /etc/os-release; }
+_svc_active() { if _is_alpine; then rc-service "$1" status &>/dev/null; else systemctl is-active --quiet "$1" 2>/dev/null; fi; }
+_svc()        { if _is_alpine; then rc-service "$2" "$1" &>/dev/null; else systemctl "$1" "$2" 2>/dev/null; fi; }
+_svc_hint()   { if _is_alpine; then echo "rc-service $2 $1"; else echo "systemctl $1 $2"; fi; }
+native_is_running() { _svc_active "${NATIVE_SERVICE}"; }
 
 # Global cleanup path — set by do_backup/do_recover, used by EXIT trap
 _CLEANUP_DIR=""
@@ -76,7 +81,7 @@ write_manifest() {
     local npm_ver="unknown"
     if [[ -f "${NATIVE_DATA_DIR}/database.sqlite" ]]; then
         npm_ver=$(strings "${NATIVE_DATA_DIR}/database.sqlite" 2>/dev/null \
-            | grep -oP 'nginx-proxy-manager@\K[\d.]+' | head -1 || echo "unknown")
+            | sed -n 's/.*nginx-proxy-manager@\([0-9.]*[0-9]\).*/\1/p' | head -1 || echo "unknown")
     fi
     cat > "${staging_dir}/${MANIFEST_FILE}" << MANIFEST
 npm-backrecov manifest
@@ -361,8 +366,8 @@ do_recover() {
     echo -e "  ${BOLD}Stopping services${NC}"
     local was_running=false
     if native_is_running; then
-        systemctl stop "${NATIVE_SERVICE}"  2>/dev/null || true
-        systemctl stop "${NATIVE_NGINX_SERVICE}" 2>/dev/null || true
+        _svc stop "${NATIVE_SERVICE}" || true
+        _svc stop "${NATIVE_NGINX_SERVICE}" || true
         was_running=true
         _pdone "Services stopped"
     else
@@ -424,20 +429,20 @@ do_recover() {
     # Step 4: Restart services
     echo ""
     echo -e "  ${BOLD}Step 4/4 — Starting services${NC}"
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl start "${NATIVE_NGINX_SERVICE}" 2>/dev/null || true
-    systemctl start "${NATIVE_SERVICE}" 2>/dev/null || true
+    _is_alpine || systemctl daemon-reload 2>/dev/null || true
+    _svc start "${NATIVE_NGINX_SERVICE}" || true
+    _svc start "${NATIVE_SERVICE}" || true
     sleep 3
     if native_is_running; then
         _pdone "NPM service started"
         _pok  "NPM is running"
     else
-        _pfail "NPM did not start — run: systemctl status ${NATIVE_SERVICE}"
+        _pfail "NPM did not start — run: $(_svc_hint status "${NATIVE_SERVICE}")"
     fi
-    if systemctl is-active --quiet "${NATIVE_NGINX_SERVICE}" 2>/dev/null; then
+    if _svc_active "${NATIVE_NGINX_SERVICE}"; then
         _pok  "nginx is running"
     else
-        _pfail "nginx did not start — run: systemctl start ${NATIVE_NGINX_SERVICE}"
+        _pfail "nginx did not start — run: $(_svc_hint start "${NATIVE_NGINX_SERVICE}")"
     fi
 
     echo ""

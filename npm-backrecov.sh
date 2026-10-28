@@ -3,7 +3,7 @@
 #  npm-backrecov.sh — Nginx Proxy Manager Backup & Recovery Tool v1.0.0
 #  Supports NPM Native and NPM Docker installations
 #  Enables migration from NPM Docker → NPM Native
-#  No Docker  |  SQLite  |  Systemd  |  Team Njordium
+#  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Authors: Kim Haverblad & Tommy Jansson
 # =============================================================================
 set -euo pipefail
@@ -12,7 +12,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # Script version & constants
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 DEFAULT_BACKUP_DIR="/opt/npm-backups"
 
 NATIVE_DATA_DIR="/data"
@@ -109,7 +109,7 @@ show_splash() {
     printf "       /___/                            /____/  v%s\n" "${SCRIPT_VERSION}"
     echo -e "${NC}"
     echo -e "  ${BOLD}${GREEN}Nginx Proxy Manager${NC}${BOLD} — Backup & Recovery Tool${NC}"
-    echo -e "  ${DIM}No Docker · SQLite · Systemd · Team Njordium${NC}"
+    echo -e "  ${DIM}No Docker · SQLite · Systemd / OpenRC · Team Njordium${NC}"
     echo -e "  ${DIM}---------------------------------------------${NC}"
     echo ""
 }
@@ -118,6 +118,13 @@ show_splash() {
 # Timestamp helpers
 # ---------------------------------------------------------------------------
 timestamp() { date '+%Y-%m-%d-%H%M%S'; }
+# v1.1.0: native installs on Alpine use OpenRC and apk
+_is_alpine()  { grep -qs '^ID=alpine' /etc/os-release; }
+_svc_active() { if _is_alpine; then rc-service "$1" status &>/dev/null; else systemctl is-active --quiet "$1" 2>/dev/null; fi; }
+_svc()        { if _is_alpine; then rc-service "$2" "$1" &>/dev/null; else systemctl "$1" "$2" 2>/dev/null; fi; }
+_svc_hint()   { if _is_alpine; then echo "rc-service $2 $1"; else echo "systemctl $1 $2"; fi; }
+_pkg_hint()   { if _is_alpine; then echo "apk add $*"; else echo "apt-get install $*"; fi; }
+_host_ip()    { ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}'; }
 datestamp()  { date '+%Y-%m-%d %H:%M:%S'; }
 
 # ---------------------------------------------------------------------------
@@ -195,7 +202,7 @@ prechecks_backup_native() {
     # certbot venv
     if [[ -f "${NATIVE_CERTBOT_VENV_DIR}/bin/activate" ]]; then
         local cb_ver
-        cb_ver=$("${NATIVE_CERTBOT_VENV_DIR}/bin/certbot" --version 2>&1 | grep -oP '[\d.]+' | head -1 || echo "?")
+        cb_ver=$("${NATIVE_CERTBOT_VENV_DIR}/bin/certbot" --version 2>&1 | grep -oE '[0-9.]+' | head -1 || echo "?")
         _pok  "/opt/certbot venv present (certbot v${cb_ver})"
         (( pass++ )) || true
     else
@@ -204,7 +211,7 @@ prechecks_backup_native() {
     fi
 
     # NPM service state
-    if systemctl is-active --quiet "${NATIVE_SERVICE}" 2>/dev/null; then
+    if _svc_active "${NATIVE_SERVICE}"; then
         _pwarn "NPM service is running — backup safe (SQLite WAL) but stop for full consistency"
         (( warn++ )) || true
     else
@@ -229,14 +236,14 @@ prechecks_backup_native() {
         _pok  "tar available ($(tar --version 2>&1 | head -1))"
         (( pass++ )) || true
     else
-        _pfail "tar not found — install with: apt-get install tar"
+        _pfail "tar not found — install with: $(_pkg_hint tar)"
         (( fail++ )) || true
     fi
     if command -v gzip &>/dev/null; then
-        _pok  "gzip available ($(gzip --version 2>&1 | head -1))"
+        _pok  "gzip available ($(gzip --version 2>/dev/null | head -1 || echo busybox))"
         (( pass++ )) || true
     else
-        _pfail "gzip not found — install with: apt-get install gzip"
+        _pfail "gzip not found — install with: $(_pkg_hint gzip)"
         (( fail++ )) || true
     fi
 
@@ -308,11 +315,11 @@ _prechecks_backup_lxc_pve() {
         if [[ "${DB_ENGINE}" == "mysql" ]]; then
             command -v mysqldump &>/dev/null \
                 && { _pok "mysqldump available"; (( pass++ )) || true; } \
-                || { _pfail "mysqldump not found — install: apt-get install mariadb-client"; (( fail++ )) || true; }
+                || { _pfail "mysqldump not found — install with: $(_pkg_hint mariadb-client)"; (( fail++ )) || true; }
         else
             command -v pg_dump &>/dev/null \
                 && { _pok "pg_dump available"; (( pass++ )) || true; } \
-                || { _pfail "pg_dump not found — install: apt-get install postgresql-client"; (( fail++ )) || true; }
+                || { _pfail "pg_dump not found — install with: $(_pkg_hint postgresql-client)"; (( fail++ )) || true; }
         fi
     elif [[ -f "${LXC_DATA_DIR}/database.sqlite" ]]; then
         local db_size
@@ -365,7 +372,7 @@ _prechecks_backup_lxc_pve() {
     # certbot venv
     if [[ -f "${LXC_CERTBOT_VENV_DIR}/bin/activate" ]]; then
         local cb_ver
-        cb_ver=$("${LXC_CERTBOT_VENV_DIR}/bin/certbot" --version 2>&1 | grep -oP '[\d.]+' | head -1 || echo "?")
+        cb_ver=$("${LXC_CERTBOT_VENV_DIR}/bin/certbot" --version 2>&1 | grep -oE '[0-9.]+' | head -1 || echo "?")
         _pok  "/opt/certbot venv present (certbot v${cb_ver})"
         (( pass++ )) || true
     else
@@ -440,7 +447,7 @@ _prechecks_backup_lxc_pve() {
         _pok  "tar and gzip available"
         (( pass++ )) || true
     else
-        _pfail "tar or gzip not found — install with: apt-get install tar gzip"
+        _pfail "tar or gzip not found — install with: $(_pkg_hint tar gzip)"
         (( fail++ )) || true
     fi
 
@@ -581,7 +588,7 @@ prechecks_backup_docker() {
                     _pok  "mysqldump available"
                     (( pass++ )) || true
                 else
-                    _pfail "mysqldump not found — install: apt-get install mariadb-client"
+                    _pfail "mysqldump not found — install with: $(_pkg_hint mariadb-client)"
                     (( fail++ )) || true
                 fi
                 ;;
@@ -592,7 +599,7 @@ prechecks_backup_docker() {
                     _pok  "pg_dump available"
                     (( pass++ )) || true
                 else
-                    _pfail "pg_dump not found — install: apt-get install postgresql-client"
+                    _pfail "pg_dump not found — install with: $(_pkg_hint postgresql-client)"
                     (( fail++ )) || true
                 fi
                 ;;
@@ -664,7 +671,7 @@ prechecks_backup_docker() {
         _pok  "tar and gzip available"
         (( pass++ )) || true
     else
-        _pfail "tar or gzip not found — install with: apt-get install tar gzip"
+        _pfail "tar or gzip not found — install with: $(_pkg_hint tar gzip)"
         (( fail++ )) || true
     fi
 
@@ -677,7 +684,7 @@ prechecks_backup_docker() {
 # Detect running NPM native service
 # ---------------------------------------------------------------------------
 native_is_running() {
-    systemctl is-active --quiet "${NATIVE_SERVICE}" 2>/dev/null
+    _svc_active "${NATIVE_SERVICE}"
 }
 
 
@@ -766,7 +773,7 @@ ask_db_type() {
             if command -v mysqldump &>/dev/null; then
                 _pok "mysqldump available"; return 0
             else
-                _pfail "mysqldump not found — install: apt-get install mariadb-client"; return 1
+                _pfail "mysqldump not found — install with: $(_pkg_hint mariadb-client)"; return 1
             fi
             ;;
         2)
@@ -780,7 +787,7 @@ ask_db_type() {
             if command -v pg_dump &>/dev/null; then
                 _pok "pg_dump available"; return 0
             else
-                _pfail "pg_dump not found — install: apt-get install postgresql-client"; return 1
+                _pfail "pg_dump not found — install with: $(_pkg_hint postgresql-client)"; return 1
             fi
             ;;
         3)
@@ -850,7 +857,7 @@ write_manifest() {
     local npm_ver="unknown"
     if [[ -f "${NATIVE_DATA_DIR}/database.sqlite" ]]; then
         npm_ver=$(strings "${NATIVE_DATA_DIR}/database.sqlite" 2>/dev/null \
-            | grep -oP 'nginx-proxy-manager@\K[\d.]+' | head -1 || echo "unknown")
+            | sed -n 's/.*nginx-proxy-manager@\([0-9.]*[0-9]\).*/\1/p' | head -1 || echo "unknown")
     fi
     cat > "${staging_dir}/${MANIFEST_FILE}" << MANIFEST
 npm-backrecov manifest
@@ -1069,7 +1076,7 @@ backup_database() {
 
         # Verify mysqldump available
         if ! command -v mysqldump &>/dev/null; then
-            _pfail "mysqldump not found — install with: apt-get install mariadb-client"
+            _pfail "mysqldump not found — install with: $(_pkg_hint mariadb-client)"
             return 1
         fi
 
@@ -1105,7 +1112,7 @@ backup_database() {
         _pinfo "Database engine: PostgreSQL (${DB_HOST}:${DB_PORT}/${DB_NAME})"
 
         if ! command -v pg_dump &>/dev/null; then
-            _pfail "pg_dump not found — install with: apt-get install postgresql-client"
+            _pfail "pg_dump not found — install with: $(_pkg_hint postgresql-client)"
             return 1
         fi
 
@@ -1177,7 +1184,7 @@ restore_database() {
 
         _pinfo "Restoring MySQL database: ${name} on ${host}:${port}"
         if ! command -v mysql &>/dev/null; then
-            _pfail "mysql client not found — install with: apt-get install mariadb-client"
+            _pfail "mysql client not found — install with: $(_pkg_hint mariadb-client)"
             return 1
         fi
 
@@ -1201,7 +1208,7 @@ restore_database() {
 
         _pinfo "Restoring PostgreSQL database: ${name} on ${host}:${port}"
         if ! command -v psql &>/dev/null; then
-            _pfail "psql not found — install with: apt-get install postgresql-client"
+            _pfail "psql not found — install with: $(_pkg_hint postgresql-client)"
             return 1
         fi
 
@@ -1264,8 +1271,8 @@ backup_native() {
         if confirm "Stop NPM service during backup?"; then
             echo ""
             echo -e "  ${BOLD}Stopping services${NC}"
-            systemctl stop "${NATIVE_SERVICE}" 2>/dev/null || true
-            systemctl stop "${NATIVE_NGINX_SERVICE}" 2>/dev/null || true
+            _svc stop "${NATIVE_SERVICE}" || true
+            _svc stop "${NATIVE_NGINX_SERVICE}" || true
             sleep 1
             if ! native_is_running; then
                 _pdone "NPM service stopped"
@@ -1406,19 +1413,19 @@ backup_native() {
     if ${stopped_native}; then
         echo ""
         echo -e "  ${BOLD}Restarting services${NC}"
-        systemctl start "${NATIVE_NGINX_SERVICE}" 2>/dev/null || true
-        systemctl start "${NATIVE_SERVICE}" 2>/dev/null || true
+        _svc start "${NATIVE_NGINX_SERVICE}" || true
+        _svc start "${NATIVE_SERVICE}" || true
         sleep 3
         if native_is_running; then
             _pdone "NPM service restarted successfully"
             _pok  "NPM is running and accepting connections"
         else
-            _pfail "NPM service did not restart — run: systemctl start ${NATIVE_SERVICE}"
+            _pfail "NPM service did not restart — run: $(_svc_hint start "${NATIVE_SERVICE}")"
         fi
-        if systemctl is-active --quiet "${NATIVE_NGINX_SERVICE}" 2>/dev/null; then
+        if _svc_active "${NATIVE_NGINX_SERVICE}"; then
             _pok  "nginx is running"
         else
-            _pfail "nginx did not restart — run: systemctl start ${NATIVE_NGINX_SERVICE}"
+            _pfail "nginx did not restart — run: $(_svc_hint start "${NATIVE_NGINX_SERVICE}")"
         fi
     fi
 
@@ -2026,8 +2033,8 @@ recover_native() {
     echo ""
     echo -e "  ${BOLD}Step 0/3 — Stopping services${NC}"
     if native_is_running; then
-        systemctl stop "${NATIVE_SERVICE}" 2>/dev/null || true
-        systemctl stop "${NATIVE_NGINX_SERVICE}" 2>/dev/null || true
+        _svc stop "${NATIVE_SERVICE}" || true
+        _svc stop "${NATIVE_NGINX_SERVICE}" || true
         was_running=true
         _pdone "NPM and nginx services stopped"
     else
@@ -2039,7 +2046,7 @@ recover_native() {
     echo -e "  ${BOLD}Step 1/3 — Restoring /data/${NC}"
     if [[ -d "${staging}/${DATA_SUBDIR}" ]]; then
         check_existing_data "${NATIVE_DATA_DIR}" "NPM" || {
-            ${was_running} && systemctl start "${NATIVE_SERVICE}" 2>/dev/null || true
+            ${was_running} && _svc start "${NATIVE_SERVICE}" || true
             return
         }
         mkdir -p "${NATIVE_DATA_DIR}"
@@ -2105,22 +2112,22 @@ recover_native() {
     echo ""
     echo -e "  ${BOLD}Starting services${NC}"
     if ${was_running} || true; then
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl start "${NATIVE_NGINX_SERVICE}" 2>/dev/null || true
-        systemctl start "${NATIVE_SERVICE}" 2>/dev/null || true
+        _is_alpine || systemctl daemon-reload 2>/dev/null || true
+        _svc start "${NATIVE_NGINX_SERVICE}" || true
+        _svc start "${NATIVE_SERVICE}" || true
         sleep 3
         if native_is_running; then
             _pdone "NPM service started"
             _pok  "nginx service started"
         else
-            _pfail "NPM service did not start — run: systemctl status ${NATIVE_SERVICE}"
+            _pfail "NPM service did not start — run: $(_svc_hint status "${NATIVE_SERVICE}")"
         fi
     fi
 
     echo ""
     if ${migration}; then
         _pdone "Migration from Docker to Native complete"
-        _pinfo "Access NPM at: http://$(hostname -I | awk '{print $1}'):81"
+        _pinfo "Access NPM at: http://$(_host_ip):81"
         _pinfo "All proxy hosts, access lists, certificates and settings restored"
     else
         _pdone "Recovery complete"
