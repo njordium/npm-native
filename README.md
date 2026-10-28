@@ -63,6 +63,18 @@ The frontend build (TypeScript compiler + Vite + sass + bundle assembly + minify
 
 Override the auto-swap behaviour with `NPM_AUTOSWAP=true|false|auto` (default `auto`), or set `NPM_SWAPFILE=/path` to place the file somewhere other than `/swapfile`. After a successful install, the operator can keep the swap for this boot only (default), persist it via `/etc/fstab`, or remove it.
 
+### nginx source (Debian / Ubuntu)
+
+On Debian, nginx is installed from the official [nginx.org](https://nginx.org/en/linux_packages.html) stable repository (signing key fingerprints are checked). An existing OS nginx is switched only after a prompt; non-interactive runs keep it. If nginx.org has no repository for the release, the OS package is used.
+
+| `NPM_NGINX_SOURCE` | Behaviour |
+| --- | --- |
+| `auto` (default) | Debian: nginx.org on fresh installs, prompt before switching an existing OS nginx. Ubuntu: OS package |
+| `nginx.org` | always use / switch to nginx.org (also on Ubuntu) |
+| `distro` | always use the OS package |
+
+Alpine always uses Alpine's nginx package.
+
 ## Usage
 
 ```

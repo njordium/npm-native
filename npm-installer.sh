@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.2.1 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.3.0 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.3.0 — Debian: nginx from nginx.org (stable) by default; existing OS nginx
+#    is switched after a prompt. Ubuntu opt-in. NPM_NGINX_SOURCE=auto|nginx.org|distro.
 #
 #  v1.2.1 — Verify: skip certs deleted in NPM (leftover certbot files).
 #
@@ -68,7 +71,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.2.1"           # installer script version
+SCRIPT_VERSION="1.3.0"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -79,6 +82,11 @@ NPM_TMP="/tmp/npm-build"
 [[ "${NPM_DATA}" =~ [^a-zA-Z0-9/_.-] ]] && { echo "FATAL: NPM_DATA contains unsafe characters: ${NPM_DATA}" >&2; exit 1; }
 NPM_SERVICE="nginx-proxy-manager"
 ADMIN_PORT=81
+# v1.3.0: nginx source on Debian/Ubuntu. auto = nginx.org on fresh Debian installs;
+# an existing distro nginx is switched after a prompt (kept when non-interactive).
+# Ubuntu keeps its own package under auto for now.
+# nginx.org = always use/switch to nginx.org, distro = always the OS package.
+NPM_NGINX_SOURCE="${NPM_NGINX_SOURCE:-auto}"
 INSTALL_MODE=""   # fresh | update | verify  (set by mode selection below)
 VERBOSE=false     # true = show all step output, false = quiet (main steps only)
 
@@ -94,7 +102,7 @@ _tmp_cleanup() {
         cp "${_BUILD_LOG}" /var/log/npm-build-failed.log 2>/dev/null \
             && echo "[!] Full build log preserved at /var/log/npm-build-failed.log" >&2
     fi
-    rm -f "${_VITE_PATCH:-}" "${_TSCONFIG_PATCH:-}" "${_BUILD_LOG:-}"
+    rm -f "${_VITE_PATCH:-}" "${_TSCONFIG_PATCH:-}" "${_BUILD_LOG:-}" "${_OLD_NGINX_CONF:-}"
 }
 trap _tmp_cleanup EXIT
 
@@ -277,6 +285,8 @@ _pkg_install() { if _is_alpine; then vrun apk add --no-cache "$@"; else vrun apt
 # _ver_lt a b: true when version a < b
 _ver_lt()      { [[ "$1" != "$2" && "$(printf '%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]; }
 _host_ip()     { ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}'; }
+# v1.3.0: true when the installed nginx package comes from nginx.org
+_nginx_is_org() { dpkg-query -W -f='${Maintainer}' nginx 2>/dev/null | grep -qi 'nginx packaging'; }
 
 # ---------------------------------------------------------------------------
 # Hard prerequisite check
@@ -573,7 +583,7 @@ fi
 # them unconditionally, so on bookworm we will patch the template later in
 # Step 6 to remove the block. Warn the user up front so the change isn't a
 # surprise. Reported in #3.
-if [[ "${_OS_CODENAME}" == "bookworm" ]]; then
+if [[ "${_OS_CODENAME}" == "bookworm" && "${NPM_NGINX_SOURCE}" == "distro" ]]; then
     warn "Debian 12 (bookworm) ships nginx 1.22.1 ${G_DASH} installer will patch NPM's _listen.conf to remove the unsupported http2 on/off directive (HTTP/2 toggle in the UI will be inert)."
 fi
 
@@ -730,6 +740,9 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     fi
     if _svc_active nginx; then
         _NGINX_V=$(nginx -v 2>&1 | grep -oP 'nginx/[\d.]+' || echo "nginx")
+        if ! _is_alpine; then
+            _nginx_is_org && _NGINX_V+=", nginx.org" || _NGINX_V+=", ${_OS_ID:-os} package"
+        fi
         _pok  "nginx                active  (${_NGINX_V})"
     else
         _pfail "nginx                NOT running"
@@ -1301,6 +1314,19 @@ if [[ -d /etc/letsencrypt ]]; then
     fi
 fi
 
+# v1.1.26: snapshot to report what the reset/rewrite drops.
+# v1.3.0: taken here, before Step 1/5 install packages, so a stock nginx.conf
+# from a freshly installed package is not reported as dropped.
+_OLD_NGINX_CONF=$(mktemp /tmp/npm-old-nginx-conf.XXXXXX)
+cp /etc/nginx/nginx.conf "${_OLD_NGINX_CONF}" 2>/dev/null || true
+_OLD_NGINX_FILES=""
+for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /etc/nginx/http.d/*.conf; do
+    # skip the stock default sites shipped by Debian, Alpine and nginx.org
+    [[ -e "${_f}" && "${_f}" != /etc/nginx/sites-enabled/default && "${_f}" != /etc/nginx/http.d/default.conf \
+        && "${_f}" != /etc/nginx/conf.d/default.conf ]] || continue
+    _OLD_NGINX_FILES+="${_f#/etc/nginx/}"$'\n'
+done
+
 # v1.1.10 (#4): tarball /etc/nginx before the conf wipe in Step 6b.
 # Customisations to nginx.conf (set_real_ip_from for new CDN, custom
 # log_format, raised client_max_body_size, extra `include`) live here
@@ -1358,6 +1384,115 @@ fi
 }  # end _maybe_upgrade_system
 _maybe_upgrade_system
 
+# v1.3.0: nginx on Debian/Ubuntu, from nginx.org (stable) or the OS repo.
+# nginx.org packages carry upstream security fixes as soon as they are
+# released and have the stream module built in.
+_NGINX_ORG_KEY_FPRS="573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62 8540A6F18833A80E9C1653A42FD21310B49F6B46 9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3"
+_NGINX_ORG_KEYRING="/usr/share/keyrings/nginx-archive-keyring.gpg"
+
+
+_setup_nginx_org_repo() {
+    local distro="debian" key fprs f
+    [[ "${_OS_ID}" == "ubuntu" ]] && distro="ubuntu"
+    if [[ -z "${_OS_CODENAME}" ]] || ! curl -fsI --max-time 10 \
+        "https://nginx.org/packages/${distro}/dists/${_OS_CODENAME}/Release" &>/dev/null; then
+        warn "nginx.org has no ${distro}/${_OS_CODENAME:-unknown} repository"
+        return 1
+    fi
+    key=$(mktemp /tmp/npm-nginx-key.XXXXXX)
+    if ! curl -fsSL --max-time 15 https://nginx.org/keys/nginx_signing.key -o "${key}"; then
+        rm -f "${key}"; warn "Could not download the nginx.org signing key"; return 1
+    fi
+    # every key in the file must be a known nginx.org key
+    fprs=$(gpg --show-keys --with-colons "${key}" 2>/dev/null | awk -F: '/^fpr/{print $10}')
+    for f in ${fprs}; do
+        if [[ " ${_NGINX_ORG_KEY_FPRS} " != *" ${f} "* ]]; then
+            rm -f "${key}"; warn "Unexpected nginx.org key fingerprint ${f} ${G_DASH} not adding the repo"; return 1
+        fi
+    done
+    [[ -n "${fprs}" ]] || { rm -f "${key}"; warn "nginx.org signing key unreadable"; return 1; }
+    gpg --dearmor < "${key}" > "${_NGINX_ORG_KEYRING}"
+    rm -f "${key}"
+    echo "deb [signed-by=${_NGINX_ORG_KEYRING}] https://nginx.org/packages/${distro} ${_OS_CODENAME} nginx" \
+        > /etc/apt/sources.list.d/nginx.list
+    # prefer nginx.org over the OS package
+    printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' \
+        > /etc/apt/preferences.d/99nginx
+    vrun apt-get update -qq
+    info "nginx.org repository added (${distro} ${_OS_CODENAME}, stable)"
+}
+
+_remove_nginx_org_repo() {
+    rm -f /etc/apt/sources.list.d/nginx.list /etc/apt/preferences.d/99nginx
+    vrun apt-get update -qq || true
+}
+
+# Decide the source in Step 1 (prompt up front), install in Step 5 so an
+# update keeps the running nginx serving proxy hosts through the build.
+_choose_nginx_source() {
+    local src="${NPM_NGINX_SOURCE}" ans=""
+    if _nginx_is_org; then
+        [[ "${src}" == "distro" ]] && warn "nginx from nginx.org is installed ${G_DASH} keeping it (no automatic downgrade to the OS package)"
+        src="nginx.org"
+    elif [[ "${src}" == "auto" && "${_OS_ID}" == "ubuntu" ]]; then
+        # not yet tested on Ubuntu (25.10 only has an older nginx.org build)
+        src="distro"
+    elif [[ "${src}" == "auto" ]]; then
+        src="nginx.org"
+        if dpkg-query -W -f='${Status}' nginx-common 2>/dev/null | grep -q 'ok installed'; then
+            if [[ -t 0 ]]; then
+                echo ""
+                echo -e "  ${BOLD}nginx is the ${_OS_PRETTY:-OS} package ($(dpkg-query -W -f='${Version}' nginx 2>/dev/null)).${NC}"
+                echo -e "  ${DIM}nginx.org stable gets upstream security fixes directly. /etc/nginx is backed up and rewritten anyway.${NC}"
+                read -rp "  Switch to nginx from nginx.org? [Y/n]: " ans || true
+                [[ "${ans}" =~ ^[Nn] ]] && src="distro"
+            else
+                warn "Keeping the OS nginx package (non-interactive). Set NPM_NGINX_SOURCE=nginx.org to switch."
+                src="distro"
+            fi
+        fi
+    fi
+    _NGINX_SRC="${src}"
+    info "nginx source: ${_NGINX_SRC}"
+}
+
+_install_nginx_debian() {
+    local src="${_NGINX_SRC:-distro}"
+    if [[ "${src}" == "nginx.org" ]] && _nginx_is_org; then
+        vrun apt-get install -y -o Dpkg::Options::=--force-confold nginx || true
+    elif [[ "${src}" == "nginx.org" ]]; then
+        if _setup_nginx_org_repo; then
+            step "Installing nginx from nginx.org"
+            # replaces nginx/nginx-common; the stream module is built in
+            _svc stop nginx || true
+            vrun apt-get remove -y libnginx-mod-stream 2>/dev/null || true
+            # Debian module links would dangle and break nginx -t
+            find /etc/nginx/modules-enabled -maxdepth 1 -xtype l -delete 2>/dev/null || true
+            if vrun apt-get install -y -o Dpkg::Options::=--force-confold nginx && _nginx_is_org; then
+                log "nginx $(dpkg-query -W -f='${Version}' nginx) from nginx.org installed."
+            else
+                warn "nginx.org install failed ${G_DASH} falling back to the OS package"
+                _remove_nginx_org_repo
+                src="distro"
+            fi
+        else
+            warn "Falling back to the OS nginx package"
+            src="distro"
+        fi
+    fi
+
+    if [[ "${src}" != "nginx.org" ]]; then
+        _pkg_install nginx libnginx-mod-stream
+    fi
+    # python3-certbot-nginx depends on "nginx"; the nginx.org package provides it
+    _pkg_install python3-certbot-nginx
+
+    # nginx.org packages run as "nginx", Debian/Ubuntu as "www-data"
+    if _nginx_is_org; then
+        NGINX_USER="nginx"
+    fi
+}
+
 # >>> SECTION: _step1_install_deps >>>
 _step1_install_deps() {
 # Step 1 — System dependencies
@@ -1400,10 +1535,9 @@ vrun apt-get install -y --no-install-recommends \
     apache2-utils \
     jq \
     rsync \
-    nginx \
-    libnginx-mod-stream \
-    certbot \
-    python3-certbot-nginx
+    certbot
+
+_choose_nginx_source
 
 log "System packages installed."
 
@@ -2062,6 +2196,9 @@ if [[ "${INSTALL_MODE}" == "update" ]] && _svc_active "${NPM_SERVICE}"; then
     _svc stop "${NPM_SERVICE}" || true
 fi
 
+# v1.3.0: install/switch nginx now (after the build, NPM already stopped)
+_is_alpine || _install_nginx_debian
+
 # Backup existing install if present
 if [[ -d "${NPM_HOME}" ]]; then
     BACKUP="${NPM_HOME}.bak-$(date +%Y%m%d%H%M%S)"
@@ -2555,19 +2692,11 @@ info "Configuring nginx for NPM (self-contained, no docker/rootfs copies)..."
 # Ensure stream module is present
 if _is_alpine; then
     apk info -e nginx-mod-stream &>/dev/null || _pkg_install nginx-mod-stream
-else
+elif ! _nginx_is_org; then
     dpkg -l libnginx-mod-stream 2>/dev/null | grep -q '^ii' \
         || _pkg_install libnginx-mod-stream
 fi
 
-# v1.1.26: snapshot to report what the reset/rewrite drops
-_OLD_NGINX_CONF=$(mktemp /tmp/npm-old-nginx-conf.XXXXXX)
-cp /etc/nginx/nginx.conf "${_OLD_NGINX_CONF}" 2>/dev/null || true
-_OLD_NGINX_FILES=""
-for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /etc/nginx/http.d/*.conf; do
-    [[ -e "${_f}" && "${_f}" != /etc/nginx/sites-enabled/default && "${_f}" != /etc/nginx/http.d/default.conf ]] || continue
-    _OLD_NGINX_FILES+="${_f#/etc/nginx/}"$'\n'
-done
 
 # ── Full reset — wipe all nginx configs to a known-empty state ──────────────
 rm -f  /etc/nginx/sites-enabled/*
@@ -2782,7 +2911,8 @@ def lines(path):
     out = []
     for l in open(path, errors="replace"):
         l = re.sub(r"\s+", " ", l.strip())
-        if l and not l.startswith("#") and l not in ("{", "}"):
+        # user/pid are set by the installer per nginx build
+        if l and not l.startswith(("#", "user ", "pid ")) and l not in ("{", "}"):
             out.append(l)
     return out
 new = set(lines(sys.argv[2]))
