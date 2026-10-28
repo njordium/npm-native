@@ -849,16 +849,30 @@ make_archive_name() {
     echo "${dest}/npm-backup-${type}-$(timestamp).tar.gz"
 }
 
+# v1.1.0: NPM version from package.json (DB strings as fallback)
+_pkg_version() { sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1; }
+npm_version() {
+    local ver=""
+    case "$1" in
+        NATIVE) ver=$(_pkg_version 2>/dev/null < /opt/nginx-proxy-manager/backend/package.json || true) ;;
+        DOCKER) [[ -n "${DOCKER_CONTAINER_NAME}" ]] && command -v docker &>/dev/null \
+                    && ver=$(docker exec "${DOCKER_CONTAINER_NAME}" cat /app/package.json 2>/dev/null | _pkg_version || true) ;;
+        *)      ver=$(_pkg_version 2>/dev/null < "${LXC_APP_DIR}/package.json" || true) ;;
+    esac
+    if [[ -z "${ver}" || "${ver}" == "0.0.0" ]] && [[ -f "${NATIVE_DATA_DIR}/database.sqlite" ]]; then
+        ver=$(strings "${NATIVE_DATA_DIR}/database.sqlite" 2>/dev/null \
+            | sed -n 's/.*nginx-proxy-manager@\([0-9.]*[0-9]\).*/\1/p' | head -1 || true)
+    fi
+    echo "${ver:-unknown}"
+}
+
 # ---------------------------------------------------------------------------
 # Write manifest
 # ---------------------------------------------------------------------------
 write_manifest() {
     local type="$1" staging_dir="$2"
-    local npm_ver="unknown"
-    if [[ -f "${NATIVE_DATA_DIR}/database.sqlite" ]]; then
-        npm_ver=$(strings "${NATIVE_DATA_DIR}/database.sqlite" 2>/dev/null \
-            | sed -n 's/.*nginx-proxy-manager@\([0-9.]*[0-9]\).*/\1/p' | head -1 || echo "unknown")
-    fi
+    local npm_ver
+    npm_ver=$(npm_version "${type}")
     cat > "${staging_dir}/${MANIFEST_FILE}" << MANIFEST
 npm-backrecov manifest
 ======================

@@ -78,11 +78,15 @@ copy_dir() {
 
 write_manifest() {
     local type="$1" staging_dir="$2"
-    local npm_ver="unknown"
-    if [[ -f "${NATIVE_DATA_DIR}/database.sqlite" ]]; then
+    local npm_ver
+    # v1.1.0: package.json first (installer stamps the version); DB strings as fallback
+    npm_ver=$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' \
+        /opt/nginx-proxy-manager/backend/package.json 2>/dev/null | head -1 || true)
+    if [[ -z "${npm_ver}" && -f "${NATIVE_DATA_DIR}/database.sqlite" ]]; then
         npm_ver=$(strings "${NATIVE_DATA_DIR}/database.sqlite" 2>/dev/null \
-            | sed -n 's/.*nginx-proxy-manager@\([0-9.]*[0-9]\).*/\1/p' | head -1 || echo "unknown")
+            | sed -n 's/.*nginx-proxy-manager@\([0-9.]*[0-9]\).*/\1/p' | head -1 || true)
     fi
+    npm_ver="${npm_ver:-unknown}"
     cat > "${staging_dir}/${MANIFEST_FILE}" << MANIFEST
 npm-backrecov manifest
 ======================
