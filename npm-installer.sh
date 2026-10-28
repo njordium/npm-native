@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.1.28 (Debian / Ubuntu)
-#  No Docker  |  SQLite  |  Systemd  |  Team Njordium
+#  Nginx Proxy Manager — Native Linux Installer v1.2.0 (Debian / Ubuntu / Alpine)
+#  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.2.0 — Alpine Linux support (apk, OpenRC, musl).
 #
 #  v1.1.28 — Verify: time sync passes in containers when the host syncs the clock.
 #
@@ -50,12 +52,21 @@ IFS=$'\n\t'
 # Without this, a `grep` with no match deep inside a heredoc dies silently.
 trap 'rc=$?; echo -e "\n[ERR] line ${LINENO}: ${BASH_COMMAND} (rc=${rc})" >&2' ERR
 
+# v1.2.0: Alpine needs python3 and GNU userland (mktemp with suffix, grep -P,
+# stat -c, find -printf, date -d, sort -V); BusyBox lacks them. Runs first.
+if grep -qs '^ID=alpine' /etc/os-release \
+    && ! { command -v python3 && mktemp --version | grep -q GNU && grep -V | grep -q GNU; } &>/dev/null; then
+    [[ $EUID -ne 0 ]] && { echo "FATAL: This script must be run as root." >&2; exit 1; }
+    apk add --no-cache -q bash python3 coreutils findutils grep sed gawk iproute2 procps util-linux curl >/dev/null \
+        || { echo "FATAL: apk could not install base tools (bash python3 coreutils grep ...)" >&2; exit 1; }
+fi
+
 # ---------------------------------------------------------------------------
 # User-tunable settings
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.1.28"           # installer script version
+SCRIPT_VERSION="1.2.0"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -236,6 +247,36 @@ _pnpm_install_with_retry() {
 }
 
 # ---------------------------------------------------------------------------
+# v1.2.0: OS family + init system helpers (debian = apt/systemd, alpine = apk/OpenRC)
+# ---------------------------------------------------------------------------
+_OS_FAMILY="debian"
+grep -qs '^ID=alpine' /etc/os-release && _OS_FAMILY="alpine"
+_is_alpine() { [[ "${_OS_FAMILY}" == "alpine" ]]; }
+
+if _is_alpine; then
+    NGINX_USER="nginx"
+    NGINX_MODULES_GLOB="/etc/nginx/modules/*.conf"
+    NGINX_PID="/run/nginx/nginx.pid"
+    NPM_UNIT="/etc/init.d/${NPM_SERVICE}"
+else
+    NGINX_USER="www-data"
+    NGINX_MODULES_GLOB="/etc/nginx/modules-enabled/*.conf"
+    NGINX_PID="/run/nginx.pid"
+    NPM_UNIT="/etc/systemd/system/${NPM_SERVICE}.service"
+fi
+
+_svc_active()  { if _is_alpine; then rc-service "$1" status &>/dev/null; else systemctl is-active --quiet "$1" 2>/dev/null; fi; }
+_svc_enabled() { if _is_alpine; then rc-update show default 2>/dev/null | grep -qw "$1"; else systemctl is-enabled --quiet "$1" 2>/dev/null; fi; }
+_svc_enable()  { if _is_alpine; then rc-update add "$1" default &>/dev/null; else systemctl enable "$1" &>/dev/null; fi; }
+_svc()         { if _is_alpine; then rc-service "$2" "$1" </dev/null &>/dev/null; else systemctl "$1" "$2" </dev/null &>/dev/null; fi; }
+_svc_hint()    { if _is_alpine; then echo "rc-service $2 $1"; else echo "systemctl $1 $2"; fi; }
+_log_hint()    { if _is_alpine; then echo "tail -n 40 /var/log/${NPM_SERVICE}.log"; else echo "journalctl -u ${NPM_SERVICE} -n 40 --no-pager"; fi; }
+_pkg_install() { if _is_alpine; then vrun apk add --no-cache "$@"; else vrun apt-get install -y --no-install-recommends "$@"; fi; }
+# _ver_lt a b: true when version a < b
+_ver_lt()      { [[ "$1" != "$2" && "$(printf '%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]; }
+_host_ip()     { ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}'; }
+
+# ---------------------------------------------------------------------------
 # Hard prerequisite check
 # ---------------------------------------------------------------------------
 # python3 is required from the very first step (_resolve_npm_version parses
@@ -406,13 +447,13 @@ SPLASH
 printf "${CYAN}       /___/                            /____/  v%s${NC}\n" "${SCRIPT_VERSION}"
 echo -e "${NC}"
 echo -e "  ${BOLD}${GREEN}Nginx Proxy Manager${NC}${BOLD} ${G_DASH} Native Linux Installer${NC}"
-echo -e "  ${DIM}No Docker ${G_DOT} SQLite ${G_DOT} Systemd ${G_DOT} Team Njordium${NC}"
+echo -e "  ${DIM}No Docker ${G_DOT} SQLite ${G_DOT} $(_is_alpine && echo OpenRC || echo Systemd) ${G_DOT} Team Njordium${NC}"
 echo -e "  ${DIM}---------------------------------------------${NC}"
 echo ""
 _TOTAL_RAM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo "0")
 # v1.1.17: show the target version with a source-aware label, and append
-# an Installed line if a prior install is detected. dpkg --compare-versions
-# is Debian/Ubuntu-native and handles semver edge cases (e.g. 2.14.10 > 2.14.2).
+# an Installed line if a prior install is detected. _ver_lt (sort -V)
+# handles semver edge cases (e.g. 2.14.10 > 2.14.2).
 _INSTALLED_NPM_VER=""
 if [[ -f "${NPM_HOME}/backend/package.json" ]]; then
     _INSTALLED_NPM_VER=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version','?'))" \
@@ -431,7 +472,7 @@ _NPM_STATUS_NOTE=""
 if [[ -n "${_INSTALLED_NPM_VER}" ]]; then
     if [[ "${_INSTALLED_NPM_VER}" == "${NPM_VERSION}" ]]; then
         _NPM_STATUS_NOTE="${GREEN}(up to date)${NC}"
-    elif dpkg --compare-versions "${_INSTALLED_NPM_VER}" lt "${NPM_VERSION}" 2>/dev/null; then
+    elif _ver_lt "${_INSTALLED_NPM_VER}" "${NPM_VERSION}"; then
         _NPM_STATUS_NOTE="${YELLOW}(update available)${NC}"
     else
         _NPM_STATUS_NOTE="${YELLOW}(installed is newer)${NC}"
@@ -519,8 +560,10 @@ _OS_PRETTY=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d 
 
 if [[ "${_OS_ID}" == "debian" ]] || [[ "${_OS_ID}" == "ubuntu" ]] ||    [[ "${_OS_LIKE}" == *"debian"* ]]; then
     info "Detected OS: ${_OS_PRETTY:-unknown} (${_OS_CODENAME:-unknown})"
+elif _is_alpine; then
+    info "Detected OS: ${_OS_PRETTY:-unknown}"
 else
-    die "Unsupported OS: ${_OS_PRETTY:-unknown}. This script supports Debian and Ubuntu."
+    die "Unsupported OS: ${_OS_PRETTY:-unknown}. This script supports Debian, Ubuntu and Alpine."
 fi
 
 # Debian 12 (bookworm) ships nginx 1.22.1, which predates the `http2 on/off`
@@ -544,7 +587,7 @@ _select_install_mode() {
 _HAS_SERVICE=false
 _HAS_HOME=false
 _HAS_DB=false
-systemctl is-active --quiet "${NPM_SERVICE}" 2>/dev/null && _HAS_SERVICE=true
+_svc_active "${NPM_SERVICE}" && _HAS_SERVICE=true
 [[ -d "${NPM_HOME}/backend" ]]            && _HAS_HOME=true
 [[ -f "${NPM_DATA}/database.sqlite" ]]    && _HAS_DB=true
 
@@ -645,7 +688,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     _sect() { echo ""; echo -e "${BOLD}${G_HBAR}${G_HBAR} $* ${G_HBAR}${G_HBAR}${NC}"; }
 
     # Cache host IP once for all verify output
-    HOST_IP=$(hostname -I | awk '{print $1}')
+    HOST_IP=$(_host_ip)
 
     echo ""
     echo -e "${BOLD}${CYAN}${G_TL2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_HBAR2}${G_TR2}${NC}"
@@ -655,9 +698,16 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
 
     # ── Services ─────────────────────────────────────────────────────────────
     _sect "Services"
-    if systemctl is-active --quiet "${NPM_SERVICE}" 2>/dev/null; then
-        _NPM_PID=$(systemctl show -p MainPID "${NPM_SERVICE}" 2>/dev/null | cut -d= -f2)
-        _NPM_MEM=$(systemctl show -p MemoryCurrent "${NPM_SERVICE}" 2>/dev/null | cut -d= -f2)
+    if _svc_active "${NPM_SERVICE}"; then
+        if _is_alpine; then
+            _NPM_PID=$(pgrep -f "node index.js" | head -1 || true)
+            _NPM_MEM=$(awk '/VmRSS/ {print $2*1024}' "/proc/${_NPM_PID:-0}/status" 2>/dev/null || true)
+            _NPM_UP=$(ps -o lstart= -p "${_NPM_PID:-0}" 2>/dev/null || true)
+        else
+            _NPM_PID=$(systemctl show -p MainPID "${NPM_SERVICE}" 2>/dev/null | cut -d= -f2)
+            _NPM_MEM=$(systemctl show -p MemoryCurrent "${NPM_SERVICE}" 2>/dev/null | cut -d= -f2)
+            _NPM_UP=$(systemctl show -p ActiveEnterTimestamp "${NPM_SERVICE}" 2>/dev/null | cut -d= -f2)
+        fi
         # MemoryCurrent can be empty or non-numeric before the service is fully running.
         # set -e does NOT catch errors inside $(( )) but non-numeric operands DO kill the script.
         if [[ "${_NPM_MEM}" =~ ^[0-9]+$ ]]; then
@@ -665,29 +715,28 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
         else
             _NPM_MEM_MB="?"
         fi
-        _NPM_UP=$(systemctl show -p ActiveEnterTimestamp "${NPM_SERVICE}" 2>/dev/null | cut -d= -f2)
         _pok  "nginx-proxy-manager  active  PID=${_NPM_PID}  MEM=${_NPM_MEM_MB}MB"
         echo -e "       ${DIM}since: ${_NPM_UP}${NC}"
     else
         _pfail "nginx-proxy-manager  NOT running"
-        echo  "       ${G_ARROW} run: systemctl start ${NPM_SERVICE}"
+        echo  "       ${G_ARROW} run: $(_svc_hint start "${NPM_SERVICE}")"
     fi
-    if systemctl is-enabled --quiet "${NPM_SERVICE}" 2>/dev/null; then
+    if _svc_enabled "${NPM_SERVICE}"; then
         _pok  "nginx-proxy-manager  enabled (auto-starts on reboot)"
     else
         _pwarn "nginx-proxy-manager  NOT enabled ${G_DASH} won't start after reboot"
     fi
-    if systemctl is-active --quiet nginx 2>/dev/null; then
+    if _svc_active nginx; then
         _NGINX_V=$(nginx -v 2>&1 | grep -oP 'nginx/[\d.]+' || echo "nginx")
         _pok  "nginx                active  (${_NGINX_V})"
     else
         _pfail "nginx                NOT running"
     fi
-    if systemctl is-enabled --quiet nginx 2>/dev/null; then
+    if _svc_enabled nginx; then
         _pok  "nginx                enabled (auto-starts on reboot)"
     else
         _pwarn "nginx                NOT enabled ${G_DASH} won't start after reboot"
-        echo  "       ${G_ARROW} run: systemctl enable nginx"
+        echo  "       ${G_ARROW} run: $(_is_alpine && echo "rc-update add nginx default" || echo "systemctl enable nginx")"
     fi
     if nginx -t &>/dev/null 2>&1; then
         _pok  "nginx config         syntax OK"
@@ -719,7 +768,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
         _API_DIRECT_STATUS=$(echo "${_API_DIRECT}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','?'))" 2>/dev/null || echo "ERR")
         if [[ "${_API_DIRECT_STATUS}" == "OK" ]]; then
             _pwarn "backend API          responding on :3000 directly but NOT via nginx port ${ADMIN_PORT} ${G_DASH} nginx is down"
-            echo  "       ${G_ARROW} run: systemctl start nginx"
+            echo  "       ${G_ARROW} run: $(_svc_hint start nginx)"
         else
             _pfail "backend API          not responding on port ${ADMIN_PORT} or :3000 directly (nginx down + backend issue)"
         fi
@@ -859,7 +908,7 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     # Time sync — cert validation breaks with a skewed clock
     _TIMESYNC_ACTIVE=false
     for _svc in chronyd systemd-timesyncd ntpd ntp; do
-        if systemctl is-active --quiet "${_svc}" 2>/dev/null; then
+        if _svc_active "${_svc}"; then
             _pok "time sync           ${_svc} active"
             _TIMESYNC_ACTIVE=true
             break
@@ -869,6 +918,11 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     if ! ${_TIMESYNC_ACTIVE} && systemd-detect-virt -cq 2>/dev/null \
         && [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
         _pok "time sync           synced by host ($(systemd-detect-virt -c))"
+        _TIMESYNC_ACTIVE=true
+    fi
+    # Alpine has no systemd-detect-virt; LXC sets container= for PID 1
+    if ! ${_TIMESYNC_ACTIVE} && _is_alpine && grep -qa 'container=' /proc/1/environ 2>/dev/null; then
+        _pok "time sync           clock from host (container)"
         _TIMESYNC_ACTIVE=true
     fi
     ${_TIMESYNC_ACTIVE} || _pwarn "time sync           no chronyd/systemd-timesyncd/ntpd active ${G_DASH} cert validation may fail"
@@ -954,8 +1008,13 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
             _DIAG_DEST="/var/backups/npm-diag-$(date +%Y%m%d%H%M%S).tar.gz"
             _DIAG_TMP=$(mktemp -d /tmp/npm-diag.XXXXXX)
             mkdir -p "${_DIAG_TMP}"/{journal,logs,config}
-            journalctl -u "${NPM_SERVICE}" -n 500 --no-pager 2>/dev/null > "${_DIAG_TMP}/journal/npm-service.log" || true
-            journalctl -u nginx -n 200 --no-pager 2>/dev/null > "${_DIAG_TMP}/journal/nginx.log" || true
+            if _is_alpine; then
+                tail -n 500 "/var/log/${NPM_SERVICE}.log" 2>/dev/null > "${_DIAG_TMP}/journal/npm-service.log" || true
+                tail -n 200 /var/log/nginx/error.log 2>/dev/null > "${_DIAG_TMP}/journal/nginx.log" || true
+            else
+                journalctl -u "${NPM_SERVICE}" -n 500 --no-pager 2>/dev/null > "${_DIAG_TMP}/journal/npm-service.log" || true
+                journalctl -u nginx -n 200 --no-pager 2>/dev/null > "${_DIAG_TMP}/journal/nginx.log" || true
+            fi
             for _lg in "${NPM_DATA}"/logs/*.log; do
                 [[ -f "${_lg}" ]] && tail -n 1000 "${_lg}" > "${_DIAG_TMP}/logs/$(basename ${_lg})" 2>/dev/null
             done
@@ -1034,7 +1093,7 @@ if [[ "${INSTALL_MODE}" == "fresh" ]]; then
         [[ "${_DB_CONFIRM}" == "YES" ]] || { info "Aborted ${G_DASH} database not touched."; exit 0; }
     fi
     # Stop and backup
-    systemctl stop "${NPM_SERVICE}" 2>/dev/null || true
+    _svc stop "${NPM_SERVICE}" || true
     if [[ -f "${NPM_DATA}/database.sqlite" ]]; then
         DB_BACKUP="${NPM_DATA}/database.sqlite.bak.$(date +%Y%m%d%H%M%S)"
         cp "${NPM_DATA}/database.sqlite" "${DB_BACKUP}"
@@ -1183,7 +1242,7 @@ PYCHANGE
         "${NPM_DATA}"/database.sqlite.bak.*
         /etc/letsencrypt.bak-*
         /var/backups/etc-nginx.bak-*.tar.gz
-        /etc/systemd/system/"${NPM_SERVICE}".service.bak-*
+        "${NPM_UNIT}".bak-*
     )
     _FOUND_BAKS=()
     for _p in "${_BAK_PATTERNS[@]}"; do
@@ -1259,12 +1318,18 @@ if [[ "${INSTALL_MODE}" != "verify" ]] && [[ -t 0 ]]; then
         echo -e "  ${DIM}Updating system packages ensures a clean foundation for the install.${NC}"
     fi
     echo ""
-    read -rp "  Run apt update && apt upgrade now? [y/N]: " _UPG_CHOICE || true
+    _UPG_CMD=$(_is_alpine && echo "apk update && apk upgrade" || echo "apt update && apt upgrade")
+    read -rp "  Run ${_UPG_CMD} now? [y/N]: " _UPG_CHOICE || true
     if [[ "${_UPG_CHOICE,,}" == "y" || "${_UPG_CHOICE,,}" == "yes" ]]; then
-        step "Updating system packages (apt update && apt upgrade)"
-        export DEBIAN_FRONTEND=noninteractive
-        vrun apt-get update -qq
-        vrun apt-get upgrade -y -qq
+        step "Updating system packages (${_UPG_CMD})"
+        if _is_alpine; then
+            vrun apk update -q
+            vrun apk upgrade -q
+        else
+            export DEBIAN_FRONTEND=noninteractive
+            vrun apt-get update -qq
+            vrun apt-get upgrade -y -qq
+        fi
         log "System packages updated."
     else
         echo -e "  ${DIM}Skipped ${G_DASH} continuing with current package versions.${NC}"
@@ -1281,6 +1346,17 @@ _step1_install_deps() {
 # Step 1 — System dependencies
 # ---------------------------------------------------------------------------
 step "Step 1/7 ${G_DASH} Installing system dependencies"
+
+if _is_alpine; then
+    vrun apk update -q
+    _pkg_install \
+        curl wget gnupg ca-certificates build-base linux-headers \
+        python3 python3-dev py3-pip openssl openssl-dev libffi-dev \
+        logrotate git sqlite apache2-utils jq rsync \
+        nginx nginx-mod-stream certbot certbot-nginx
+    log "System packages installed."
+    return 0
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -1370,11 +1446,26 @@ if command -v node &>/dev/null; then
         _NEED_NODE=false
     else
         warn "Node.js $(node --version) is too old (need v${NODE_MAJOR}+). Upgrading..."
-        vrun apt-get remove -y nodejs npm 2>/dev/null || true
+        _is_alpine || vrun apt-get remove -y nodejs npm 2>/dev/null || true
     fi
 fi
 
-if ${_NEED_NODE}; then
+if ${_NEED_NODE} && _is_alpine; then
+    # NodeSource has no Alpine repo; use apk (nodejs-current if nodejs is too old)
+    _pkg_install nodejs npm
+    _INSTALLED=$(node --version 2>/dev/null | grep -oP '\d+' | head -1 || true)
+    if [[ -z "${_INSTALLED}" || "${_INSTALLED}" -lt "${NODE_MAJOR}" ]]; then
+        warn "apk nodejs is v${_INSTALLED:-none} ${G_DASH} trying nodejs-current"
+        vrun apk del nodejs 2>/dev/null || true
+        _pkg_install nodejs-current npm
+    fi
+    _INSTALLED=$(node --version 2>/dev/null | grep -oP '\d+' | head -1 || true)
+    if [[ -n "${_INSTALLED}" && "${_INSTALLED}" -ge "${NODE_MAJOR}" ]]; then
+        log "Node.js $(node --version) installed."
+    else
+        warn "Node.js ${NODE_MAJOR}+ not available from apk (got: $(node --version 2>/dev/null || echo 'none'))."
+    fi
+elif ${_NEED_NODE}; then
     # Run the nodesource setup script — this adds the nodesource APT repo.
     # Double quotes are CRITICAL: they let ${NODE_MAJOR} expand to '22' before
     # being passed to bash. Single quotes would send the literal string
@@ -1407,7 +1498,7 @@ if ! command -v npm &>/dev/null; then
     if command -v corepack &>/dev/null; then
         vrun corepack enable npm
     else
-        vrun apt-get install -y npm
+        _pkg_install npm
     fi
 fi
 
@@ -1437,7 +1528,7 @@ step "Step 3/7 ${G_DASH} Cloning NPM v${NPM_VERSION} source"
 #
 # git clone --depth 1 fetches the exact tagged commit's complete working tree,
 # bypassing export rules. Shallow clone = no history, fast and lean.
-command -v git &>/dev/null || apt-get install -y --no-install-recommends git -qq
+command -v git &>/dev/null || _pkg_install git
 
 # Clean and recreate build workspace
 rm -rf "${NPM_TMP}"
@@ -1949,9 +2040,9 @@ step "Step 6/7 ${G_DASH} Installing backend dependencies and configuring"
 # --update mode the service has been serving traffic through the entire
 # frontend build above; this is the start of the unavoidable downtime
 # window. Fresh installs are a no-op here (nothing to stop).
-if [[ "${INSTALL_MODE}" == "update" ]] && systemctl is-active --quiet "${NPM_SERVICE}" 2>/dev/null; then
+if [[ "${INSTALL_MODE}" == "update" ]] && _svc_active "${NPM_SERVICE}"; then
     info "Stopping ${NPM_SERVICE} for the install swap..."
-    systemctl stop "${NPM_SERVICE}" 2>/dev/null || true
+    _svc stop "${NPM_SERVICE}" || true
 fi
 
 # Backup existing install if present
@@ -2010,7 +2101,7 @@ fi
 # on bookworm who need HTTP/2 should install nginx from nginx.org or from
 # bookworm-backports). No-op on nginx 1.25+, idempotent on re-runs.
 _NGINX_VER=$(nginx -v 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1 || true)
-if [[ -n "${_NGINX_VER}" ]] && dpkg --compare-versions "${_NGINX_VER}" lt 1.25.1; then
+if [[ -n "${_NGINX_VER}" ]] && _ver_lt "${_NGINX_VER}" 1.25.1; then
     _LISTEN_TPL="${NPM_HOME}/backend/templates/_listen.conf"
     if [[ -f "${_LISTEN_TPL}" ]] && grep -q 'http2 on' "${_LISTEN_TPL}"; then
         python3 - "${_LISTEN_TPL}" << 'PYHTTP2'
@@ -2445,15 +2536,19 @@ _step6b_configure_nginx() {
 info "Configuring nginx for NPM (self-contained, no docker/rootfs copies)..."
 
 # Ensure stream module is present
-dpkg -l libnginx-mod-stream 2>/dev/null | grep -q '^ii' \
-    || vrun apt-get install -y --no-install-recommends libnginx-mod-stream -qq
+if _is_alpine; then
+    apk info -e nginx-mod-stream &>/dev/null || _pkg_install nginx-mod-stream
+else
+    dpkg -l libnginx-mod-stream 2>/dev/null | grep -q '^ii' \
+        || _pkg_install libnginx-mod-stream
+fi
 
 # v1.1.26: snapshot to report what the reset/rewrite drops
 _OLD_NGINX_CONF=$(mktemp /tmp/npm-old-nginx-conf.XXXXXX)
 cp /etc/nginx/nginx.conf "${_OLD_NGINX_CONF}" 2>/dev/null || true
 _OLD_NGINX_FILES=""
-for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
-    [[ -e "${_f}" && "${_f}" != /etc/nginx/sites-enabled/default ]] || continue
+for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /etc/nginx/http.d/*.conf; do
+    [[ -e "${_f}" && "${_f}" != /etc/nginx/sites-enabled/default && "${_f}" != /etc/nginx/http.d/default.conf ]] || continue
     _OLD_NGINX_FILES+="${_f#/etc/nginx/}"$'\n'
 done
 
@@ -2463,6 +2558,7 @@ rm -f  /etc/nginx/sites-available/*
 rm -f  /etc/nginx/conf.d/*.conf
 rm -rf /etc/nginx/conf.d/include
 rm -rf /etc/nginx/conf.d/stream
+rm -f  /etc/nginx/http.d/*.conf   # Alpine's default site (not included by our nginx.conf)
 
 # ── Create required directory structure ─────────────────────────────────────
 mkdir -p /etc/nginx/conf.d/include
@@ -2471,7 +2567,7 @@ mkdir -p /etc/nginx/conf
 # v1.1.20: persistent temp path (was /tmp/nginx/body -- wiped on reboot,
 # breaking nginx -t and every NPM "save proxy host" call afterwards).
 mkdir -p /var/lib/nginx/body
-chown www-data:www-data /var/lib/nginx/body 2>/dev/null || true
+chown "${NGINX_USER}:${NGINX_USER}" /var/lib/nginx/body 2>/dev/null || true
 mkdir -p /data/logs
 mkdir -p /data/letsencrypt-acme-challenge/.well-known/acme-challenge
 mkdir -p /tmp/letsencrypt-lib
@@ -2511,11 +2607,11 @@ cat > /etc/nginx/nginx.conf << 'NGINX_CONF'
 # Nginx Proxy Manager — native nginx.conf
 # Node.js backend: port 3000 (internal). nginx proxies :81 → :3000 for admin UI.
 
-user www-data;
+user __NGINX_USER__;
 worker_processes auto;
-pid /run/nginx.pid;
+pid __NGINX_PID__;
 
-include /etc/nginx/modules-enabled/*.conf;
+include __NGINX_MODULES__;
 
 events {
     worker_connections 1024;
@@ -2659,7 +2755,7 @@ NGINX_CONF
 
 # Replace placeholders with actual paths (keeps heredoc single-quoted to avoid
 # escaping dozens of nginx $ variables)
-sed -i "s|__NPM_HOME__|${NPM_HOME}|g; s|__NPM_DATA__|${NPM_DATA}|g" /etc/nginx/nginx.conf
+sed -i "s|__NPM_HOME__|${NPM_HOME}|g; s|__NPM_DATA__|${NPM_DATA}|g; s|__NGINX_USER__|${NGINX_USER}|; s|__NGINX_PID__|${NGINX_PID}|; s|__NGINX_MODULES__|${NGINX_MODULES_GLOB}|" /etc/nginx/nginx.conf
 
 # v1.1.26: warn about dropped nginx.conf lines (not carried over)
 if [[ -s "${_OLD_NGINX_CONF}" ]]; then
@@ -2749,6 +2845,17 @@ fi
 
 nginx -t &>/dev/null || die "nginx config test failed ${G_DASH} run: nginx -t for details."
 
+if _is_alpine; then
+    _svc_enable nginx || true
+    _svc_enabled nginx || warn "nginx may not be enabled for autostart ${G_DASH} run: rc-update add nginx default"
+    log "nginx enabled for autostart."
+    _svc restart nginx || _svc start nginx || true
+    sleep 1
+    _svc_active nginx || die "nginx failed to start ${G_DASH} run: rc-service nginx start  or: tail /var/log/nginx/error.log"
+    log "nginx configured, enabled, and running."
+    return 0
+fi
+
 # Enable nginx to start on boot and verify the symlink was created
 systemctl enable nginx 2>/dev/null || true
 systemctl is-enabled nginx &>/dev/null || warn "nginx may not be enabled for autostart ${G_DASH} run: systemctl enable nginx"
@@ -2808,15 +2915,66 @@ _step6c_logrotate
 _step7_systemd_service() {
 # Create systemd service
 # ---------------------------------------------------------------------------
-step "Step 7/7 ${G_DASH} Creating systemd service and starting NPM"
+step "Step 7/7 ${G_DASH} Creating $(_is_alpine && echo OpenRC || echo systemd) service and starting NPM"
+
+if _is_alpine; then
+    if [[ "${INSTALL_MODE}" == "update" && -f "${NPM_UNIT}" ]]; then
+        UNIT_BACKUP="${NPM_UNIT}.bak-$(date +%Y%m%d%H%M%S)"
+        cp "${NPM_UNIT}" "${UNIT_BACKUP}" 2>/dev/null && warn "Existing OpenRC script backed up to ${UNIT_BACKUP}"
+        warn "Replacing ${NPM_UNIT}. Put local overrides in /etc/conf.d/${NPM_SERVICE} (preserved)."
+    fi
+    _CERTBOT_EXPORT=""
+    [[ -n "${_CERTBOT_VER:-}" ]] && _CERTBOT_EXPORT="export CERTBOT_VERSION=${_CERTBOT_VER}"
+    # supervise-daemon restarts node on crash (like Restart=on-failure)
+    cat > "${NPM_UNIT}" <<OPENRC
+#!/sbin/openrc-run
+# Nginx Proxy Manager (written by npm-installer.sh)
+description="Nginx Proxy Manager"
+
+supervisor=supervise-daemon
+command=/usr/bin/node
+command_args="index.js --abort_on_uncaught_exception --max_old_space_size=250"
+directory="${NPM_HOME}/backend"
+output_log="/var/log/${NPM_SERVICE}.log"
+error_log="/var/log/${NPM_SERVICE}.log"
+respawn_delay=10
+respawn_max=0
+
+# prepend only: openrc-run needs its own helper dirs in PATH
+export PATH="/opt/certbot/bin:\${PATH}"
+export NODE_ENV=production
+export SUPPRESS_NO_CONFIG_WARNING=1
+export NGINX_BINARY=/usr/sbin/nginx
+${_CERTBOT_EXPORT}
+
+depend() {
+    need net nginx
+    use dns logger
+}
+
+start_pre() {
+    mkdir -p /tmp/letsencrypt-lib ${NPM_DATA}/letsencrypt-acme-challenge/.well-known/acme-challenge \\
+        ${NPM_DATA}/nginx/default_host ${NPM_DATA}/nginx/default_www ${NPM_DATA}/access ${NPM_DATA}/custom_ssl
+}
+OPENRC
+    chmod 755 "${NPM_UNIT}"
+    _svc_enable "${NPM_SERVICE}" || true
+    if _svc_enabled "${NPM_SERVICE}"; then
+        log "Service ${NPM_SERVICE} enabled for autostart on boot."
+    else
+        warn "Service ${NPM_SERVICE} may not be enabled ${G_DASH} run: rc-update add ${NPM_SERVICE} default"
+    fi
+    _svc restart "${NPM_SERVICE}" || _svc start "${NPM_SERVICE}" || true
+    return 0
+fi
 
 # v1.1.10 (#5): back up + warn before replacing the main unit. Drop-ins
 # under ${NPM_SERVICE}.service.d/ (added via `systemctl edit`) are
 # preserved across the rewrite; lines added directly to the main unit
 # (Environment=DEBUG=..., custom ExecStart args) are lost.
-if [[ "${INSTALL_MODE}" == "update" ]] && [[ -f "/etc/systemd/system/${NPM_SERVICE}.service" ]]; then
-    UNIT_BACKUP="/etc/systemd/system/${NPM_SERVICE}.service.bak-$(date +%Y%m%d%H%M%S)"
-    if cp "/etc/systemd/system/${NPM_SERVICE}.service" "${UNIT_BACKUP}" 2>/dev/null; then
+if [[ "${INSTALL_MODE}" == "update" ]] && [[ -f "${NPM_UNIT}" ]]; then
+    UNIT_BACKUP="${NPM_UNIT}.bak-$(date +%Y%m%d%H%M%S)"
+    if cp "${NPM_UNIT}" "${UNIT_BACKUP}" 2>/dev/null; then
         warn "Existing systemd unit backed up to ${UNIT_BACKUP}"
     fi
     warn "Replacing main systemd unit. Drop-ins under ${NPM_SERVICE}.service.d/ are preserved; Environment= / ExecStart= lines added directly to the main unit will be lost."
@@ -2832,7 +2990,7 @@ else
     _CERTBOT_ENV_LINE=""
 fi
 
-cat > "/etc/systemd/system/${NPM_SERVICE}.service" <<SERVICE
+cat > "${NPM_UNIT}" <<SERVICE
 [Unit]
 Description=Nginx Proxy Manager
 Documentation=https://nginxproxymanager.com
@@ -2941,14 +3099,16 @@ done
 echo ""
 
 # Drop-ins served their purpose — remove them so future restarts use journal.
-rm -f "${_DROPIN}" "${_NGINX_DROPIN}" 2>/dev/null || true
-rmdir --ignore-fail-on-non-empty "${_DROPIN_DIR}" "${_NGINX_DROPIN_DIR}" 2>/dev/null || true
-systemctl daemon-reload </dev/null >/dev/null 2>&1
+if ! _is_alpine; then
+    rm -f "${_DROPIN}" "${_NGINX_DROPIN}" 2>/dev/null || true
+    rmdir --ignore-fail-on-non-empty "${_DROPIN_DIR}" "${_NGINX_DROPIN_DIR}" 2>/dev/null || true
+    systemctl daemon-reload </dev/null >/dev/null 2>&1
+fi
 
 if [[ ${RETRIES} -eq 0 ]]; then
     echo ""
     warn "NPM did not respond within $((30 * INTERVAL))s."
-    warn "Check: journalctl -u ${NPM_SERVICE} -n 40 --no-pager"
+    warn "Check: $(_log_hint)"
 else
     # v1.1.9 (#6): beyond connectivity — verify the API actually reports OK.
     # Express binds the port the moment Node starts, BEFORE knex migrations
@@ -2965,7 +3125,7 @@ else
         log "NPM is up and responding (API health: OK)."
     else
         warn "Service responding on port ${ADMIN_PORT}, but /api/ returned '${_API_HEALTH}' instead of OK."
-        warn "Likely cause: knex migration failure. Check: journalctl -u ${NPM_SERVICE} -n 40 --no-pager"
+        warn "Likely cause: knex migration failure. Check: $(_log_hint)"
         # v1.1.16: surface the unhealthy API to _finalize so it can print
         # a yellow "completed with warnings" banner instead of green
         # "Installation Complete".
@@ -3025,7 +3185,7 @@ fi
 # essentially everything.
 _KEEP=${NPM_KEEP_BACKUPS:-2}
 if [[ "${_KEEP}" =~ ^[0-9]+$ ]]; then
-    _STALE=$(ls -1dt "${NPM_HOME}".bak-* 2>/dev/null | tail -n +$(( _KEEP + 1 )))
+    _STALE=$( { ls -1dt "${NPM_HOME}".bak-* 2>/dev/null || true; } | tail -n +$(( _KEEP + 1 )))
     if [[ -n "${_STALE}" ]]; then
         _N=$(echo "${_STALE}" | wc -l)
         info "Pruning ${_N} old install backup(s), keeping ${_KEEP} most recent (override via NPM_KEEP_BACKUPS=N)"
@@ -3036,7 +3196,7 @@ fi
 # ---------------------------------------------------------------------------
 # Final status + summary
 # ---------------------------------------------------------------------------
-HOST_IP=$(hostname -I | awk '{print $1}')
+HOST_IP=$(_host_ip)
 
 echo ""
 # v1.1.16: banner colour reflects API health detected in _step7b. Green for
@@ -3059,7 +3219,7 @@ echo ""
 if [[ "${_INSTALL_HEALTH:-ok}" != "ok" ]]; then
     echo -e "  ${YELLOW}API health   :${NC} ${_INSTALL_HEALTH} ${G_DASH} the service started but /api/ is not returning OK."
     echo -e "  ${DIM}Investigate with:${NC}"
-    echo -e "    ${DIM}sudo journalctl -u ${NPM_SERVICE} -n 40 --no-pager${NC}"
+    echo -e "    ${DIM}sudo $(_log_hint)${NC}"
     echo -e "    ${DIM}sudo bash $0 --verify${NC}"
     echo ""
 fi
