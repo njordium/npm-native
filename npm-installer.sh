@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.2.0 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.2.1 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.2.1 — Verify: skip certs deleted in NPM (leftover certbot files).
 #
 #  v1.2.0 — Alpine Linux support (apk, OpenRC, musl).
 #
@@ -66,7 +68,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.2.0"           # installer script version
+SCRIPT_VERSION="1.2.1"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -952,11 +954,24 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     fi
 
     # Per-cert expiry inside /etc/letsencrypt/live/<domain>/cert.pem
+    # v1.2.1: skip npm-<id> certs that are deleted (or absent) in the NPM database
     if [[ -d /etc/letsencrypt/live ]]; then
         _CERT_FOUND=0
+        _CERT_SKIPPED=""
+        _ACTIVE_CERT_IDS=""
+        # filter only when the query succeeds (a locked DB must not hide certs)
+        if [[ -f "${NPM_DATA}/database.sqlite" ]] && command -v sqlite3 &>/dev/null \
+            && _ids=$(sqlite3 "${NPM_DATA}/database.sqlite" "SELECT id FROM certificate WHERE is_deleted=0" 2>/dev/null); then
+            _ACTIVE_CERT_IDS=" $(echo "${_ids}" | tr '\n' ' ')"
+        fi
         while IFS= read -r _cert; do
-            _CERT_FOUND=$(( _CERT_FOUND + 1 ))
             _domain=$(basename "$(dirname "${_cert}")")
+            if [[ -n "${_ACTIVE_CERT_IDS}" && "${_domain}" =~ ^npm-([0-9]+)$ \
+                && "${_ACTIVE_CERT_IDS}" != *" ${BASH_REMATCH[1]} "* ]]; then
+                _CERT_SKIPPED+="${_domain} "
+                continue
+            fi
+            _CERT_FOUND=$(( _CERT_FOUND + 1 ))
             _expiry=$(openssl x509 -enddate -noout -in "${_cert}" 2>/dev/null | cut -d= -f2)
             if [[ -z "${_expiry}" ]]; then
                 _pwarn "cert ${_domain}      could not read expiry (openssl x509 failed)"
@@ -972,7 +987,9 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
             else _pok  "cert ${_domain}      ${_days_left} days until expiry (${_expiry_human})"
             fi
         done < <(find /etc/letsencrypt/live -name 'cert.pem' 2>/dev/null)
-        if [[ ${_CERT_FOUND} -eq 0 ]]; then
+        if [[ -n "${_CERT_SKIPPED}" ]]; then
+            echo -e "       ${DIM}skipped (deleted in NPM): ${_CERT_SKIPPED% }${NC}"
+        elif [[ ${_CERT_FOUND} -eq 0 ]]; then
             _pwarn "Let'''s Encrypt certs no /etc/letsencrypt/live/*/cert.pem found yet ${G_DASH} expected on a fresh install"
         fi
     fi
