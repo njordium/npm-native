@@ -207,7 +207,7 @@ Produces a dashboard similar to (UTF-8 terminal -- ASCII fallback is used automa
 Verify thresholds:
 
 - **Disk free**: `< 100 MB` FAIL, `< 1 GB` WARN, otherwise PASS
-- **Cert expiry**: expired or `< 7 days` FAIL, `< 30 days` WARN, otherwise PASS
+- **Cert expiry**: expired or `< 7 days` FAIL, `< 30 days` WARN, otherwise PASS; `npm-<id>` certs deleted in NPM (leftover certbot files) are skipped
 - **Time sync**: any of chronyd / systemd-timesyncd / ntpd / ntp active → PASS, else WARN
 - **SQLite**: `PRAGMA integrity_check == "ok"` → PASS
 
