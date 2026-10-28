@@ -101,7 +101,7 @@ _tmp_cleanup() {
         cp "${_BUILD_LOG}" /var/log/npm-build-failed.log 2>/dev/null \
             && echo "[!] Full build log preserved at /var/log/npm-build-failed.log" >&2
     fi
-    rm -f "${_VITE_PATCH:-}" "${_TSCONFIG_PATCH:-}" "${_BUILD_LOG:-}"
+    rm -f "${_VITE_PATCH:-}" "${_TSCONFIG_PATCH:-}" "${_BUILD_LOG:-}" "${_OLD_NGINX_CONF:-}"
 }
 trap _tmp_cleanup EXIT
 
@@ -1312,6 +1312,19 @@ if [[ -d /etc/letsencrypt ]]; then
         warn "Failed to back up /etc/letsencrypt ${G_DASH} proceeding anyway"
     fi
 fi
+
+# v1.1.26: snapshot to report what the reset/rewrite drops.
+# v1.3.0: taken here, before Step 1/5 install packages, so a stock nginx.conf
+# from a freshly installed package is not reported as dropped.
+_OLD_NGINX_CONF=$(mktemp /tmp/npm-old-nginx-conf.XXXXXX)
+cp /etc/nginx/nginx.conf "${_OLD_NGINX_CONF}" 2>/dev/null || true
+_OLD_NGINX_FILES=""
+for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /etc/nginx/http.d/*.conf; do
+    # skip the stock default sites shipped by Debian, Alpine and nginx.org
+    [[ -e "${_f}" && "${_f}" != /etc/nginx/sites-enabled/default && "${_f}" != /etc/nginx/http.d/default.conf \
+        && "${_f}" != /etc/nginx/conf.d/default.conf ]] || continue
+    _OLD_NGINX_FILES+="${_f#/etc/nginx/}"$'\n'
+done
 
 # v1.1.10 (#4): tarball /etc/nginx before the conf wipe in Step 6b.
 # Customisations to nginx.conf (set_real_ip_from for new CDN, custom
@@ -2680,16 +2693,6 @@ elif ! _nginx_is_org; then
         || _pkg_install libnginx-mod-stream
 fi
 
-# v1.1.26: snapshot to report what the reset/rewrite drops
-_OLD_NGINX_CONF=$(mktemp /tmp/npm-old-nginx-conf.XXXXXX)
-cp /etc/nginx/nginx.conf "${_OLD_NGINX_CONF}" 2>/dev/null || true
-_OLD_NGINX_FILES=""
-for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /etc/nginx/http.d/*.conf; do
-    # skip the stock default sites shipped by Debian, Alpine and nginx.org
-    [[ -e "${_f}" && "${_f}" != /etc/nginx/sites-enabled/default && "${_f}" != /etc/nginx/http.d/default.conf \
-        && "${_f}" != /etc/nginx/conf.d/default.conf ]] || continue
-    _OLD_NGINX_FILES+="${_f#/etc/nginx/}"$'\n'
-done
 
 # ── Full reset — wipe all nginx configs to a known-empty state ──────────────
 rm -f  /etc/nginx/sites-enabled/*
@@ -2904,7 +2907,8 @@ def lines(path):
     out = []
     for l in open(path, errors="replace"):
         l = re.sub(r"\s+", " ", l.strip())
-        if l and not l.startswith("#") and l not in ("{", "}"):
+        # user/pid are set by the installer per nginx build
+        if l and not l.startswith(("#", "user ", "pid ")) and l not in ("{", "}"):
             out.append(l)
     return out
 new = set(lines(sys.argv[2]))
