@@ -4,8 +4,8 @@
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.3.0 — Debian/Ubuntu: nginx from nginx.org (stable) by default; existing
-#    OS nginx is switched after a prompt. NPM_NGINX_SOURCE=auto|nginx.org|distro.
+#  v1.3.0 — Debian: nginx from nginx.org (stable) by default; existing OS nginx
+#    is switched after a prompt. Ubuntu opt-in. NPM_NGINX_SOURCE=auto|nginx.org|distro.
 #
 #  v1.2.1 — Verify: skip certs deleted in NPM (leftover certbot files).
 #
@@ -82,8 +82,9 @@ NPM_TMP="/tmp/npm-build"
 [[ "${NPM_DATA}" =~ [^a-zA-Z0-9/_.-] ]] && { echo "FATAL: NPM_DATA contains unsafe characters: ${NPM_DATA}" >&2; exit 1; }
 NPM_SERVICE="nginx-proxy-manager"
 ADMIN_PORT=81
-# v1.3.0: nginx source on Debian/Ubuntu. auto = nginx.org on fresh installs;
+# v1.3.0: nginx source on Debian/Ubuntu. auto = nginx.org on fresh Debian installs;
 # an existing distro nginx is switched after a prompt (kept when non-interactive).
+# Ubuntu keeps its own package under auto for now.
 # nginx.org = always use/switch to nginx.org, distro = always the OS package.
 NPM_NGINX_SOURCE="${NPM_NGINX_SOURCE:-auto}"
 INSTALL_MODE=""   # fresh | update | verify  (set by mode selection below)
@@ -1433,6 +1434,9 @@ _choose_nginx_source() {
     if _nginx_is_org; then
         [[ "${src}" == "distro" ]] && warn "nginx from nginx.org is installed ${G_DASH} keeping it (no automatic downgrade to the OS package)"
         src="nginx.org"
+    elif [[ "${src}" == "auto" && "${_OS_ID}" == "ubuntu" ]]; then
+        # not yet tested on Ubuntu (25.10 only has an older nginx.org build)
+        src="distro"
     elif [[ "${src}" == "auto" ]]; then
         src="nginx.org"
         if dpkg-query -W -f='${Status}' nginx-common 2>/dev/null | grep -q 'ok installed'; then
