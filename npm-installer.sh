@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.3.1 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.3.2 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.3.2 — nginx temp dirs chowned recursively: subdirs left by www-data broke
+#    large uploads (500) after the switch to nginx.org. Verify checks it.
 #
 #  v1.3.1 — Ubuntu: nginx.org by default when it has the current stable build;
 #    warn when nginx.org is behind. NPM unit backups go to /var/backups.
@@ -74,7 +77,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.3.1"           # installer script version
+SCRIPT_VERSION="1.3.2"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -906,6 +909,17 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
         _pok  "nginx -t syntax OK (proxy host config creation will succeed)"
     else
         _pfail "nginx -t FAILED ${G_DASH} proxy host config creation will silently roll back (run: nginx -t)"
+    fi
+
+    # v1.3.2: request bodies over the buffer size are written here by the worker user
+    _NGX_U=$(awk '$1=="user"{sub(/;$/,"",$2); print $2; exit}' /etc/nginx/nginx.conf 2>/dev/null || true)
+    _NGX_U="${_NGX_U:-${NGINX_USER}}"
+    _BAD=$(find /var/lib/nginx/body /var/lib/nginx/cache/public /var/lib/nginx/cache/private ! -user "${_NGX_U}" 2>/dev/null | wc -l || true)
+    if [[ ${_BAD} -eq 0 ]]; then
+        _pok  "nginx temp dirs      /var/lib/nginx/body + cache owned by ${_NGX_U}"
+    else
+        _pfail "nginx temp dirs      ${_BAD} entries not owned by ${_NGX_U} ${G_DASH} large uploads fail with 500"
+        echo  "       ${G_ARROW} run: chown -R ${_NGX_U}:${_NGX_U} /var/lib/nginx/body /var/lib/nginx/cache/public /var/lib/nginx/cache/private"
     fi
 
     # ── Environment ──────────────────────────────────────────────────────────
@@ -2741,7 +2755,8 @@ mkdir -p /etc/nginx/conf
 # v1.1.20: persistent temp path (was /tmp/nginx/body -- wiped on reboot,
 # breaking nginx -t and every NPM "save proxy host" call afterwards).
 mkdir -p /var/lib/nginx/body
-chown "${NGINX_USER}:${NGINX_USER}" /var/lib/nginx/body 2>/dev/null || true
+# v1.3.2: -R, subdirs from an earlier worker user (www-data) broke large uploads
+chown -R "${NGINX_USER}:${NGINX_USER}" /var/lib/nginx/body 2>/dev/null || true
 mkdir -p /data/logs
 mkdir -p /data/letsencrypt-acme-challenge/.well-known/acme-challenge
 mkdir -p /tmp/letsencrypt-lib
@@ -2759,6 +2774,7 @@ mkdir -p /data/access
 mkdir -p /data/custom_ssl
 mkdir -p /var/lib/nginx/cache/public
 mkdir -p /var/lib/nginx/cache/private
+chown -R "${NGINX_USER}:${NGINX_USER}" /var/lib/nginx/cache/public /var/lib/nginx/cache/private 2>/dev/null || true
 
 # ── Write resolvers.conf ─────────────────────────────────────────────────────
 RESOLVERS=$(awk 'BEGIN{ORS=" "} $1=="nameserver" {
