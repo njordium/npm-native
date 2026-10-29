@@ -14,7 +14,7 @@ This script fills that gap.
 - Manages everything with **systemd** (OpenRC on Alpine) -- auto-starts on boot, restarts on failure
 - Uses **SQLite** via `better-sqlite3` -- no external database required
 - Builds the frontend from source with **pnpm** (v10 and v11 supported) -- no Docker, no pre-built image
-- Supports **Debian 12 (Bookworm)**, **Debian 13 (Trixie)**, **Ubuntu 22.04**, **Ubuntu 24.04**, **Ubuntu 25.10**, **Alpine 3.24**
+- Supports **Debian 12 (Bookworm)**, **Debian 13 (Trixie)**, **Ubuntu 22.04**, **Ubuntu 24.04**, **Ubuntu 25.10**, **Ubuntu 26.04**, **Alpine 3.24**
 - Installs and configures **certbot** in a managed virtualenv for Let's Encrypt SSL certificates
 - Provides an interactive **verify mode** with a 30+ check health-check dashboard
 - Takes timestamped backups before every destructive step (database, `/etc/letsencrypt`, `/etc/nginx`, systemd unit, prior install) and auto-prunes older copies
@@ -65,11 +65,11 @@ Override the auto-swap behaviour with `NPM_AUTOSWAP=true|false|auto` (default `a
 
 ### nginx source (Debian / Ubuntu)
 
-On Debian, nginx is installed from the official [nginx.org](https://nginx.org/en/linux_packages.html) stable repository (signing key fingerprints are checked). An existing OS nginx is switched only after a prompt; non-interactive runs keep it. If nginx.org has no repository for the release, the OS package is used.
+On Debian and Ubuntu, nginx is installed from the official [nginx.org](https://nginx.org/en/linux_packages.html) stable repository (signing key fingerprints are checked). An existing OS nginx is switched only after a prompt; non-interactive runs keep it. If nginx.org has no repository for the release, the OS package is used. On Ubuntu, `auto` also keeps the OS package when nginx.org does not have the current stable version for the release (e.g. 25.10); forcing `nginx.org` there warns.
 
 | `NPM_NGINX_SOURCE` | Behaviour |
 | --- | --- |
-| `auto` (default) | Debian: nginx.org on fresh installs, prompt before switching an existing OS nginx. Ubuntu: OS package |
+| `auto` (default) | nginx.org on fresh installs, prompt before switching an existing OS nginx. Ubuntu: only when nginx.org has the current stable |
 | `nginx.org` | always use / switch to nginx.org (also on Ubuntu) |
 | `distro` | always use the OS package |
 

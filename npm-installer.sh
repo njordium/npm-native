@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.3.0 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.3.1 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.3.1 — Ubuntu: nginx.org by default when it has the current stable build;
+#    warn when nginx.org is behind. NPM unit backups go to /var/backups.
 #
 #  v1.3.0 — Debian: nginx from nginx.org (stable) by default; existing OS nginx
 #    is switched after a prompt. Ubuntu opt-in. NPM_NGINX_SOURCE=auto|nginx.org|distro.
@@ -71,7 +74,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.3.0"           # installer script version
+SCRIPT_VERSION="1.3.1"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -1273,6 +1276,7 @@ PYCHANGE
         /etc/letsencrypt.bak-*
         /var/backups/etc-nginx.bak-*.tar.gz
         "${NPM_UNIT}".bak-*
+        /var/backups/"${NPM_UNIT##*/}".bak-*
     )
     _FOUND_BAKS=()
     for _p in "${_BAK_PATTERNS[@]}"; do
@@ -1390,6 +1394,27 @@ _maybe_upgrade_system
 _NGINX_ORG_KEY_FPRS="573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62 8540A6F18833A80E9C1653A42FD21310B49F6B46 9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3"
 _NGINX_ORG_KEYRING="/usr/share/keyrings/nginx-archive-keyring.gpg"
 
+# v1.3.1: newest nginx.org package for this release vs. the current stable
+_nginx_org_pkg_ver() {
+    local distro="debian" arch
+    [[ "${_OS_ID}" == "ubuntu" ]] && distro="ubuntu"
+    arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+    curl -fsSL --max-time 15 "https://nginx.org/packages/${distro}/dists/${_OS_CODENAME}/nginx/binary-${arch}/Packages.gz" 2>/dev/null \
+        | gzip -dc 2>/dev/null \
+        | awk '/^Package: nginx$/{p=1} p&&/^Version:/{sub(/-.*/,"",$2); print $2; p=0}' | sort -V | tail -1 || true
+}
+_nginx_stable_ver() {
+    curl -fsSL --max-time 10 https://nginx.org/en/download.html 2>/dev/null \
+        | grep -oP 'Stable version.*?nginx-\K[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+}
+# true when nginx.org has the current stable for this release (or stable is unknown)
+_nginx_org_current() {
+    _NGINX_ORG_VER=$(_nginx_org_pkg_ver)
+    _NGINX_STABLE_VER=$(_nginx_stable_ver)
+    [[ -n "${_NGINX_ORG_VER}" ]] || return 1
+    [[ -z "${_NGINX_STABLE_VER}" ]] || ! _ver_lt "${_NGINX_ORG_VER}" "${_NGINX_STABLE_VER}"
+}
+
 
 _setup_nginx_org_repo() {
     local distro="debian" key fprs f
@@ -1398,6 +1423,9 @@ _setup_nginx_org_repo() {
         "https://nginx.org/packages/${distro}/dists/${_OS_CODENAME}/Release" &>/dev/null; then
         warn "nginx.org has no ${distro}/${_OS_CODENAME:-unknown} repository"
         return 1
+    fi
+    if ! _nginx_org_current && [[ -n "${_NGINX_ORG_VER}" ]]; then
+        warn "nginx.org only has nginx ${_NGINX_ORG_VER} for ${_OS_CODENAME} (current stable: ${_NGINX_STABLE_VER}) ${G_DASH} it may lack security fixes"
     fi
     key=$(mktemp /tmp/npm-nginx-key.XXXXXX)
     if ! curl -fsSL --max-time 15 https://nginx.org/keys/nginx_signing.key -o "${key}"; then
@@ -1434,8 +1462,8 @@ _choose_nginx_source() {
     if _nginx_is_org; then
         [[ "${src}" == "distro" ]] && warn "nginx from nginx.org is installed ${G_DASH} keeping it (no automatic downgrade to the OS package)"
         src="nginx.org"
-    elif [[ "${src}" == "auto" && "${_OS_ID}" == "ubuntu" ]]; then
-        # not yet tested on Ubuntu (25.10 only has an older nginx.org build)
+    elif [[ "${src}" == "auto" && "${_OS_ID}" == "ubuntu" ]] && ! _nginx_org_current; then
+        info "nginx.org has ${_NGINX_ORG_VER:-no build} for ${_OS_CODENAME} (stable: ${_NGINX_STABLE_VER:-unknown}) ${G_DASH} using the OS package"
         src="distro"
     elif [[ "${src}" == "auto" ]]; then
         src="nginx.org"
@@ -3065,8 +3093,13 @@ _step7_systemd_service() {
 step "Step 7/7 ${G_DASH} Creating $(_is_alpine && echo OpenRC || echo systemd) service and starting NPM"
 
 if _is_alpine; then
+    # v1.3.1: OpenRC lists every file in init.d as a service, so move old backups out
+    for _b in "${NPM_UNIT}".bak-*; do
+        if [[ -f "${_b}" ]]; then mkdir -p /var/backups && mv "${_b}" /var/backups/; fi
+    done
     if [[ "${INSTALL_MODE}" == "update" && -f "${NPM_UNIT}" ]]; then
-        UNIT_BACKUP="${NPM_UNIT}.bak-$(date +%Y%m%d%H%M%S)"
+        mkdir -p /var/backups
+        UNIT_BACKUP="/var/backups/${NPM_UNIT##*/}.bak-$(date +%Y%m%d%H%M%S)"
         cp "${NPM_UNIT}" "${UNIT_BACKUP}" 2>/dev/null && warn "Existing OpenRC script backed up to ${UNIT_BACKUP}"
         warn "Replacing ${NPM_UNIT}. Put local overrides in /etc/conf.d/${NPM_SERVICE} (preserved)."
     fi
@@ -3120,7 +3153,8 @@ fi
 # preserved across the rewrite; lines added directly to the main unit
 # (Environment=DEBUG=..., custom ExecStart args) are lost.
 if [[ "${INSTALL_MODE}" == "update" ]] && [[ -f "${NPM_UNIT}" ]]; then
-    UNIT_BACKUP="${NPM_UNIT}.bak-$(date +%Y%m%d%H%M%S)"
+    mkdir -p /var/backups
+    UNIT_BACKUP="/var/backups/${NPM_UNIT##*/}.bak-$(date +%Y%m%d%H%M%S)"
     if cp "${NPM_UNIT}" "${UNIT_BACKUP}" 2>/dev/null; then
         warn "Existing systemd unit backed up to ${UNIT_BACKUP}"
     fi
