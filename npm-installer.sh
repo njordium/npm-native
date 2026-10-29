@@ -4,8 +4,10 @@
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
 #
-#  v1.3.2 — nginx temp dirs chowned recursively: subdirs left by www-data broke
-#    large uploads (500) after the switch to nginx.org. Verify checks it.
+#  v1.3.2 — nginx temp/cache dirs chowned recursively to the worker user:
+#    subdirs left by www-data broke large uploads (500) after the switch to
+#    nginx.org. Leftover temp files and the /tmp pnpm store are removed;
+#    /data/nginx/temp no longer world-writable. Verify checks all of it.
 #
 #  v1.3.1 — Ubuntu: nginx.org by default when it has the current stable build;
 #    warn when nginx.org is behind. NPM unit backups go to /var/backups.
@@ -109,6 +111,10 @@ _tmp_cleanup() {
             && echo "[!] Full build log preserved at /var/log/npm-build-failed.log" >&2
     fi
     rm -f "${_VITE_PATCH:-}" "${_TSCONFIG_PATCH:-}" "${_BUILD_LOG:-}" "${_OLD_NGINX_CONF:-}"
+    # v1.3.2: no build tree / pnpm store left in /tmp after a failed run
+    if [[ ${rc} -ne 0 && "${INSTALL_MODE:-}" =~ ^(fresh|update)$ ]]; then
+        rm -rf "${NPM_TMP:-/nonexistent}" /tmp/.pnpm-store
+    fi
 }
 trap _tmp_cleanup EXIT
 
@@ -293,6 +299,26 @@ _ver_lt()      { [[ "$1" != "$2" && "$(printf '%s\n' "$1" "$2" | sort -V | head 
 _host_ip()     { ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}'; }
 # v1.3.0: true when the installed nginx package comes from nginx.org
 _nginx_is_org() { dpkg-query -W -f='${Maintainer}' nginx 2>/dev/null | grep -qi 'nginx packaging'; }
+# v1.3.2: dirs the nginx workers write to (compiled-in temp paths + ours)
+_nginx_worker_dirs() {
+    { nginx -V 2>&1 | grep -oE -- '--http-[a-z-]+-temp-path=[^ ]+' | cut -d= -f2
+      printf '%s\n' /var/lib/nginx/body /var/lib/nginx/cache/public /var/lib/nginx/cache/private
+    } | sort -u || true
+}
+_nginx_worker_user() {
+    local u
+    u=$(awk '$1=="user"{sub(/;$/,"",$2); print $2; exit}' /etc/nginx/nginx.conf 2>/dev/null || true)
+    echo "${u:-${NGINX_USER}}"
+}
+# temp files are removed after each request; older than a day = left by a crash
+_stale_temp_files() {
+    local d
+    while read -r d; do
+        [[ "${d}" == */cache/* || ! -d "${d}" ]] && continue
+        find "${d}" -type f -mmin +1440 2>/dev/null || true
+    done < <(_nginx_worker_dirs)
+    find "${NPM_DATA}/nginx/temp" -maxdepth 1 -type f -mmin +1440 2>/dev/null || true
+}
 
 # ---------------------------------------------------------------------------
 # Hard prerequisite check
@@ -911,15 +937,46 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
         _pfail "nginx -t FAILED ${G_DASH} proxy host config creation will silently roll back (run: nginx -t)"
     fi
 
-    # v1.3.2: request bodies over the buffer size are written here by the worker user
-    _NGX_U=$(awk '$1=="user"{sub(/;$/,"",$2); print $2; exit}' /etc/nginx/nginx.conf 2>/dev/null || true)
-    _NGX_U="${_NGX_U:-${NGINX_USER}}"
-    _BAD=$(find /var/lib/nginx/body /var/lib/nginx/cache/public /var/lib/nginx/cache/private ! -user "${_NGX_U}" 2>/dev/null | wc -l || true)
+    # v1.3.2: worker-written dirs, worker-read paths, leftover temp files
+    _NGX_U=$(_nginx_worker_user)
+    _BAD=0; _WDIRS=""
+    while read -r _d; do
+        [[ -d "${_d}" ]] || continue
+        _WDIRS+="${_d} "
+        _BAD=$(( _BAD + $(find "${_d}" ! -user "${_NGX_U}" 2>/dev/null | wc -l || true) ))
+    done < <(_nginx_worker_dirs)
     if [[ ${_BAD} -eq 0 ]]; then
-        _pok  "nginx temp dirs      /var/lib/nginx/body + cache owned by ${_NGX_U}"
+        _pok  "nginx temp dirs      owned by ${_NGX_U} (client body, proxy, cache)"
     else
         _pfail "nginx temp dirs      ${_BAD} entries not owned by ${_NGX_U} ${G_DASH} large uploads fail with 500"
-        echo  "       ${G_ARROW} run: chown -R ${_NGX_U}:${_NGX_U} /var/lib/nginx/body /var/lib/nginx/cache/public /var/lib/nginx/cache/private"
+        echo  "       ${G_ARROW} run: chown -R ${_NGX_U}:${_NGX_U} ${_WDIRS}"
+    fi
+    _UNREAD=""
+    while read -r _p; do
+        [[ -e "${_p}" ]] || continue
+        su -s /bin/sh "${_NGX_U}" -c "test -r '${_p}' && { test ! -d '${_p}' || test -x '${_p}'; }" 2>/dev/null \
+            || _UNREAD+="${_p} "
+    done < <(nginx -T 2>/dev/null | awk '$1~/^(root|alias|auth_basic_user_file)$/ && $2!~/\$/ {sub(/;$/,"",$2); print $2}' | sort -u || true)
+    if [[ -z "${_UNREAD}" ]]; then
+        _pok  "nginx read paths     web roots + access lists readable by ${_NGX_U}"
+    else
+        _pfail "nginx read paths     not readable by ${_NGX_U}: ${_UNREAD}${G_DASH} 403/500 on those hosts"
+    fi
+    _STALE=$(_stale_temp_files | wc -l || true)
+    if [[ ${_STALE} -eq 0 ]]; then
+        _pok  "nginx temp files     no leftovers"
+    else
+        _pwarn "nginx temp files     ${_STALE} leftover file(s) older than a day ${G_DASH} removed by --update"
+    fi
+    if [[ -n "$(find "${NPM_DATA}/nginx/temp" -maxdepth 0 -perm -o+w 2>/dev/null || true)" ]]; then
+        _pwarn "${NPM_DATA}/nginx/temp  world-writable ${G_DASH} nginx includes *.conf from it (run: chmod 755 ${NPM_DATA}/nginx/temp)"
+    fi
+    _LEFT=$( { find /tmp -maxdepth 1 \( -name .pnpm-store -o -name "${NPM_TMP##*/}" \); find /tmp -maxdepth 1 -name 'npm-*' -mmin +1440; } 2>/dev/null | sort -u || true)
+    if [[ -z "${_LEFT}" ]]; then
+        _pok  "installer temp       nothing left in /tmp"
+    else
+        # shellcheck disable=SC2086
+        _pwarn "installer temp       $(echo "${_LEFT}" | wc -l) leftover(s) in /tmp ($(du -shc ${_LEFT} 2>/dev/null | tail -1 | cut -f1)) ${G_DASH} removed by --update"
     fi
 
     # ── Environment ──────────────────────────────────────────────────────────
@@ -2755,8 +2812,6 @@ mkdir -p /etc/nginx/conf
 # v1.1.20: persistent temp path (was /tmp/nginx/body -- wiped on reboot,
 # breaking nginx -t and every NPM "save proxy host" call afterwards).
 mkdir -p /var/lib/nginx/body
-# v1.3.2: -R, subdirs from an earlier worker user (www-data) broke large uploads
-chown -R "${NGINX_USER}:${NGINX_USER}" /var/lib/nginx/body 2>/dev/null || true
 mkdir -p /data/logs
 mkdir -p /data/letsencrypt-acme-challenge/.well-known/acme-challenge
 mkdir -p /tmp/letsencrypt-lib
@@ -2774,7 +2829,13 @@ mkdir -p /data/access
 mkdir -p /data/custom_ssl
 mkdir -p /var/lib/nginx/cache/public
 mkdir -p /var/lib/nginx/cache/private
-chown -R "${NGINX_USER}:${NGINX_USER}" /var/lib/nginx/cache/public /var/lib/nginx/cache/private 2>/dev/null || true
+# v1.3.2: -R, subdirs from an earlier worker user (www-data) broke large uploads
+while read -r _d; do
+    if [[ -d "${_d}" ]]; then chown -R "${NGINX_USER}:${NGINX_USER}" "${_d}" 2>/dev/null || true; fi
+done < <(_nginx_worker_dirs)
+_stale_temp_files | xargs -r rm -f
+# nginx includes *.conf from here as root
+chmod 755 "${NPM_DATA}/nginx/temp" 2>/dev/null || true
 
 # ── Write resolvers.conf ─────────────────────────────────────────────────────
 RESOLVERS=$(awk 'BEGIN{ORS=" "} $1=="nameserver" {
@@ -3339,6 +3400,9 @@ _finalize() {
 # Cleanup build artifacts
 # ---------------------------------------------------------------------------
 vrun rm -rf "${NPM_TMP}"
+# v1.3.2: pnpm falls back to a store in /tmp (often tmpfs, ~500 MB)
+rm -rf /tmp/.pnpm-store
+find /tmp -maxdepth 1 -name 'npm-*' -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
 
 # v1.1.19: if we created a swap file at preflight, ask whether to keep,
 # persist via /etc/fstab, or remove. Default (pressing Enter or non-tty) =
