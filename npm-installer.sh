@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.3.2 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.3.3 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.3.3 — certbot deploy hook reloads nginx after renewals (upstream #5943);
+#    HSTS Sub-domains per host (#5947). Verify: served certs, rejected host
+#    configs (.err), Node.js security release.
 #
 #  v1.3.2 — nginx temp/cache dirs chowned recursively to the worker user:
 #    subdirs left by www-data broke large uploads (500) after the switch to
@@ -79,7 +83,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.3.2"           # installer script version
+SCRIPT_VERSION="1.3.3"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -90,6 +94,7 @@ NPM_TMP="/tmp/npm-build"
 [[ "${NPM_DATA}" =~ [^a-zA-Z0-9/_.-] ]] && { echo "FATAL: NPM_DATA contains unsafe characters: ${NPM_DATA}" >&2; exit 1; }
 NPM_SERVICE="nginx-proxy-manager"
 ADMIN_PORT=81
+LE_RELOAD_HOOK="/etc/letsencrypt/renewal-hooks/deploy/npm-reload-nginx"
 # v1.3.0: nginx source on Debian/Ubuntu. auto = nginx.org on fresh Debian installs;
 # an existing distro nginx is switched after a prompt (kept when non-interactive).
 # Ubuntu keeps its own package under auto for now.
@@ -979,6 +984,29 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
         _pwarn "installer temp       $(echo "${_LEFT}" | wc -l) leftover(s) in /tmp ($(du -shc ${_LEFT} 2>/dev/null | tail -1 | cut -f1)) ${G_DASH} removed by --update"
     fi
 
+    # v1.3.3: configs nginx rejected (NPM renames them .err, the host is offline)
+    _ERRS=$(find "${NPM_DATA}/nginx" -mindepth 2 -maxdepth 2 -name '*.err' 2>/dev/null | sort || true)
+    if [[ -z "${_ERRS}" ]]; then
+        _pok  "host configs         none rejected by nginx (.err)"
+    else
+        _pwarn "host configs         $(echo "${_ERRS}" | wc -l) rejected by nginx, those hosts are offline: $(echo "${_ERRS}" | sed "s#${NPM_DATA}/nginx/##" | tr '\n' ' ')"
+        echo  "       ${G_ARROW} fix the host in the UI (often Advanced config) and save it again"
+    fi
+    # shellcheck disable=SC2016  # literal $ in the regex
+    _HSTS_OLD=$(grep -l 'map \$scheme \$hsts_header' "${NPM_DATA}"/nginx/*/*.conf "${NPM_HOME}/backend/templates/_hsts_map.conf" 2>/dev/null | wc -l || true)
+    if ! grep -q 'Strict-Transport-Security' "${NPM_HOME}/backend/templates/_hsts.conf" 2>/dev/null; then
+        _pfail "HSTS                 template _hsts.conf has no Strict-Transport-Security ${G_DASH} new hosts lose HSTS (run --update)"
+    elif [[ ${_HSTS_OLD} -eq 0 ]]; then
+        _pok  "HSTS                 Sub-domains set per host"
+    else
+        _pwarn "HSTS                 global \$hsts_header in ${_HSTS_OLD} file(s) ${G_DASH} one host's Sub-domains setting applies to all (run --update)"
+    fi
+    if [[ -x "${LE_RELOAD_HOOK}" ]]; then
+        _pok  "cert reload hook     nginx reloads after renewals"
+    else
+        _pwarn "cert reload hook     missing ${G_DASH} renewed certs are not served until nginx reloads (run --update)"
+    fi
+
     # ── Environment ──────────────────────────────────────────────────────────
     # v1.1.15: catches "disk full / clock skew / db corrupt" issues that
     # otherwise surface as silent failures days later.
@@ -1078,6 +1106,43 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
             echo -e "       ${DIM}skipped (deleted in NPM): ${_CERT_SKIPPED% }${NC}"
         elif [[ ${_CERT_FOUND} -eq 0 ]]; then
             _pwarn "Let'''s Encrypt certs no /etc/letsencrypt/live/*/cert.pem found yet ${G_DASH} expected on a fresh install"
+        fi
+    fi
+
+    # v1.3.3: the cert nginx serves must be the one on disk (a renewal without
+    # a reload keeps serving the old one until it expires)
+    if [[ -f "${NPM_DATA}/database.sqlite" ]] && command -v sqlite3 &>/dev/null; then
+        _SRV_OK=0; _SRV_OLD=""
+        while IFS='|' read -r _id _dom; do
+            _crt=$(awk '$1=="ssl_certificate" {sub(/;$/,"",$2); print $2; exit}' "${NPM_DATA}/nginx/proxy_host/${_id}.conf" 2>/dev/null || true)
+            [[ -n "${_crt}" && -r "${_crt}" && -n "${_dom}" ]] || continue
+            _disk=$(openssl x509 -noout -serial -in "${_crt}" 2>/dev/null || true)
+            _live=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:443 -servername "${_dom}" 2>/dev/null \
+                | openssl x509 -noout -serial 2>/dev/null || true)
+            [[ -n "${_live}" ]] || continue
+            if [[ "${_disk}" == "${_live}" ]]; then _SRV_OK=$(( _SRV_OK + 1 )); else _SRV_OLD+="${_dom} "; fi
+        done < <(sqlite3 "${NPM_DATA}/database.sqlite" \
+            "SELECT id, json_extract(domain_names,'\$[0]') FROM proxy_host WHERE is_deleted=0 AND enabled=1 AND certificate_id>0" 2>/dev/null || true)
+        if [[ -n "${_SRV_OLD}" ]]; then
+            _pfail "certs served         old cert still loaded for: ${_SRV_OLD}${G_DASH} run: $(_svc_hint reload nginx)"
+        elif [[ ${_SRV_OK} -gt 0 ]]; then
+            _pok  "certs served         ${_SRV_OK} host(s) serve the cert on disk"
+        fi
+    fi
+
+    # v1.3.3: Node.js behind the latest security release of its major line
+    _NODE_V=$(node --version 2>/dev/null || true)
+    _NODE_SEC=$(curl -sf --max-time 5 https://nodejs.org/dist/index.json 2>/dev/null | python3 -c '
+import json, sys
+m = sys.argv[1].lstrip("v").split(".")[0]
+for r in json.load(sys.stdin):
+    if r["version"].startswith("v%s." % m) and r.get("security"):
+        print(r["version"]); break' "${_NODE_V:-v0}" 2>/dev/null || true)
+    if [[ -n "${_NODE_V}" && -n "${_NODE_SEC}" ]]; then
+        if _ver_lt "${_NODE_V#v}" "${_NODE_SEC#v}"; then
+            _pwarn "Node.js              ${_NODE_V} is below security release ${_NODE_SEC} ($(_is_alpine && echo "apk upgrade nodejs" || echo "apt-get install --only-upgrade nodejs"))"
+        else
+            _pok  "Node.js              ${_NODE_V} (latest security release ${_NODE_SEC})"
         fi
     fi
 
@@ -1692,6 +1757,13 @@ _NEED_NODE=true
 if command -v node &>/dev/null; then
     EXISTING_NODE=$(node --version 2>/dev/null | grep -oP '\d+' | head -1 || true)
     if [[ "${EXISTING_NODE}" -ge "${NODE_MAJOR}" ]]; then
+        # v1.3.3: pick up security releases within the installed major line
+        if _is_alpine; then
+            _NODE_PKG=nodejs; apk info -e nodejs-current &>/dev/null && _NODE_PKG=nodejs-current
+            vrun apk upgrade -q "${_NODE_PKG}" || true
+        else
+            vrun apt-get install -y -qq --only-upgrade nodejs || true
+        fi
         log "Node.js $(node --version) already installed ${G_DASH} skipping."
         _NEED_NODE=false
     else
@@ -2401,6 +2473,31 @@ PYHTTP2
     fi
 fi
 
+# v1.3.3: HSTS per host (upstream #5947). $hsts_header is a map, so it is one
+# global variable and one host's Sub-domains setting applied to all hosts.
+# Templates and existing host configs get the value written out literally.
+python3 - "${NPM_HOME}/backend/templates" "${NPM_DATA}/nginx" << 'PYHSTS'
+import glob, os, re, sys
+tpl, data = sys.argv[1:3]
+val = '"max-age=63072000;{% if hsts_subdomains == 1 or hsts_subdomains == true -%} includeSubDomains;{% endif %} preload"'
+p = os.path.join(tpl, "_hsts.conf")
+src = open(p).read() if os.path.isfile(p) else ""
+if "$hsts_header" in src:
+    open(p, "w").write(src.replace("$hsts_header", val))
+    open(os.path.join(tpl, "_hsts_map.conf"), "w").write("")
+    print("  HSTS templates patched")
+n = 0
+for f in glob.glob(os.path.join(data, "*", "*.conf")):
+    s = open(f).read()
+    m = re.search(r'map \$scheme \$hsts_header \{\s*https\s+("[^"]*");\s*\}\n?', s)
+    if m:
+        s = s.replace(m.group(0), "").replace("$hsts_header", m.group(1))
+        open(f, "w").write(s)
+        n += 1
+if n:
+    print(f"  HSTS written per host in {n} config(s)")
+PYHSTS
+
 info "Installing backend node_modules in final location..."
 cd "${NPM_HOME}/backend"
 
@@ -3078,6 +3175,23 @@ done
 # ── Copy letsencrypt.ini ──────────────────────────────────────────────────────
 [[ -f "${NPM_TMP}/docker/rootfs/etc/letsencrypt.ini" ]] && \
     cp "${NPM_TMP}/docker/rootfs/etc/letsencrypt.ini" /etc/letsencrypt.ini
+
+# v1.3.3: NPM does not reload nginx after a renewal (upstream #5943), so the
+# old cert stays loaded. certbot runs this hook for NPM and system renewals.
+mkdir -p "${LE_RELOAD_HOOK%/*}"
+cat > "${LE_RELOAD_HOOK}" << 'LEHOOK'
+#!/bin/sh
+# npm-native: load renewed certificates (NPM does not reload nginx, upstream #5943)
+nginx -t -q 2>/dev/null || { echo "npm-reload-nginx: nginx -t failed, not reloading" >&2; exit 0; }
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active -q nginx; then
+    systemctl reload nginx
+elif command -v rc-service >/dev/null 2>&1; then
+    rc-service nginx reload
+else
+    nginx -s reload
+fi
+LEHOOK
+chmod 755 "${LE_RELOAD_HOOK}"
 
 # ── Copy default web root (404 pages etc.) ───────────────────────────────────
 mkdir -p /var/www/html

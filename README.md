@@ -152,6 +152,7 @@ Depending on the chosen mode, the script may also ask:
 | Let's Encrypt config | `/etc/letsencrypt.ini` |
 | Certbot work dir | `/tmp/letsencrypt-lib/` |
 | ACME webroot | `/data/letsencrypt-acme-challenge/` |
+| Cert reload hook | `/etc/letsencrypt/renewal-hooks/deploy/npm-reload-nginx` (reloads nginx after each renewal; NPM itself does not) |
 | Logs | `/data/logs/` |
 
 ### Backups (created automatically)
@@ -211,6 +212,8 @@ Produces a dashboard similar to (UTF-8 terminal -- ASCII fallback is used automa
   [PASS] Let's Encrypt API            reachable
   [PASS] cert proxy.example.com       87 days until expiry (2026-09-19)
   [WARN] cert old.example.com         expires in 14 days (2026-07-08)
+  [PASS] certs served                 2 host(s) serve the cert on disk
+  [PASS] Node.js                      v22.23.4 (latest security release v22.23.4)
 ══════════════════════════════════════════════════════════════
   31 passed  0 failed  1 warnings  / 32 total checks
   Save diagnostic bundle to /var/backups/npm-diag-<ts>.tar.gz? [Y/n]:
@@ -222,6 +225,10 @@ Verify thresholds:
 - **Cert expiry**: expired or `< 7 days` FAIL, `< 30 days` WARN, otherwise PASS; `npm-<id>` certs deleted in NPM (leftover certbot files) are skipped
 - **Time sync**: any of chronyd / systemd-timesyncd / ntpd / ntp active → PASS, else WARN
 - **SQLite**: `PRAGMA integrity_check == "ok"` → PASS
+- **Certs served**: the cert nginx serves for each proxy host must match the file on disk, else FAIL (renewed but not reloaded)
+- **Host configs**: `*.conf.err` files (configs nginx rejected; the host is offline) → WARN
+- **HSTS / cert reload hook**: global `$hsts_header` left or reload hook missing → WARN (fixed by `--update`)
+- **Node.js**: below the latest security release of its major line → WARN
 
 ---
 
