@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.3.3 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.3.4 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.3.4 — certs deleted in NPM are moved out of certbot (npm-certbot-prune,
+#    also before each certbot.timer run), so certbot stops renewing them.
 #
 #  v1.3.3 — certbot deploy hook reloads nginx after renewals (upstream #5943);
 #    HSTS Sub-domains per host (#5947). Verify: served certs, rejected host
@@ -83,7 +86,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.3.3"           # installer script version
+SCRIPT_VERSION="1.3.4"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -95,6 +98,7 @@ NPM_TMP="/tmp/npm-build"
 NPM_SERVICE="nginx-proxy-manager"
 ADMIN_PORT=81
 LE_RELOAD_HOOK="/etc/letsencrypt/renewal-hooks/deploy/npm-reload-nginx"
+LE_PRUNE="/usr/local/sbin/npm-certbot-prune"
 # v1.3.0: nginx source on Debian/Ubuntu. auto = nginx.org on fresh Debian installs;
 # an existing distro nginx is switched after a prompt (kept when non-interactive).
 # Ubuntu keeps its own package under auto for now.
@@ -1005,6 +1009,17 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
         _pok  "cert reload hook     nginx reloads after renewals"
     else
         _pwarn "cert reload hook     missing ${G_DASH} renewed certs are not served until nginx reloads (run --update)"
+    fi
+    # v1.3.4: certbot lineages of certs deleted in NPM
+    if [[ ! -x "${LE_PRUNE}" ]]; then
+        _pwarn "certbot inactive     ${LE_PRUNE##*/} missing ${G_DASH} certs deleted in NPM are still renewed (run --update)"
+    else
+        _INACT=$("${LE_PRUNE}" --dry-run 2>/dev/null | tr '\n' ' ' || true)
+        if [[ -z "${_INACT}" ]]; then
+            _pok  "certbot inactive     no certs deleted in NPM left for certbot to renew"
+        else
+            _pwarn "certbot inactive     deleted in NPM but still renewed by certbot: ${_INACT}${G_DASH} run: ${LE_PRUNE}"
+        fi
     fi
 
     # ── Environment ──────────────────────────────────────────────────────────
@@ -3192,6 +3207,48 @@ else
 fi
 LEHOOK
 chmod 755 "${LE_RELOAD_HOOK}"
+
+# v1.3.4: certs deleted in NPM keep their certbot lineage, so the system
+# certbot timer keeps renewing them until Let's Encrypt pauses the name.
+# npm-certbot-prune moves those lineages to /var/backups.
+mkdir -p "${LE_PRUNE%/*}"    # no /usr/local/sbin on Alpine
+cat > "${LE_PRUNE}" << LEPRUNE
+#!/bin/sh
+# npm-native: move certbot lineages of certs deleted in NPM out of /etc/letsencrypt
+# so certbot stops renewing them. --dry-run only lists them.
+DB=${NPM_DATA}/database.sqlite
+LE=/etc/letsencrypt
+[ -d "\$LE/renewal" ] && [ -r "\$DB" ] || exit 0
+# only certs NPM marks deleted; unknown ids (restore, other tools) are left alone
+ids=\$(sqlite3 "\$DB" "SELECT id FROM certificate WHERE is_deleted=1" 2>/dev/null) || exit 0
+dest=""
+for c in "\$LE"/renewal/npm-*.conf; do
+    [ -e "\$c" ] || continue
+    n=\${c##*/}; n=\${n%.conf}; id=\${n#npm-}
+    case "\$id" in ''|*[!0-9]*) continue ;; esac
+    echo "\$ids" | grep -qx "\$id" || continue
+    grep -rqs -- "/live/\$n/" ${NPM_DATA}/nginx && continue    # still used by a host config
+    if [ "\$1" = "--dry-run" ]; then echo "\$n"; continue; fi
+    if [ -z "\$dest" ]; then
+        dest=/var/backups/letsencrypt-inactive-\$(date +%Y%m%d%H%M%S)
+        mkdir -p "\$dest/renewal" "\$dest/live" "\$dest/archive"
+    fi
+    mv "\$c" "\$dest/renewal/"
+    for d in live archive; do [ -d "\$LE/\$d/\$n" ] && mv "\$LE/\$d/\$n" "\$dest/\$d/"; done
+    echo "npm-certbot-prune: \$n is not active in NPM, moved to \$dest"
+    logger -t npm-certbot-prune "\$n moved to \$dest" 2>/dev/null || true
+done
+exit 0
+LEPRUNE
+chmod 755 "${LE_PRUNE}"
+"${LE_PRUNE}" || true
+# run it before every system certbot renewal (Debian/Ubuntu certbot.timer)
+if ! _is_alpine && [[ -n "$(systemctl list-unit-files certbot.service --no-legend 2>/dev/null)" ]]; then
+    mkdir -p /etc/systemd/system/certbot.service.d
+    printf '%s\n' "# npm-native: skip certs deleted in NPM" "[Service]" "ExecStartPre=-${LE_PRUNE}" \
+        > /etc/systemd/system/certbot.service.d/npm-prune.conf
+    systemctl daemon-reload &>/dev/null || true
+fi
 
 # ── Copy default web root (404 pages etc.) ───────────────────────────────────
 mkdir -p /var/www/html

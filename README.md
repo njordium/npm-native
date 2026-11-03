@@ -153,6 +153,7 @@ Depending on the chosen mode, the script may also ask:
 | Certbot work dir | `/tmp/letsencrypt-lib/` |
 | ACME webroot | `/data/letsencrypt-acme-challenge/` |
 | Cert reload hook | `/etc/letsencrypt/renewal-hooks/deploy/npm-reload-nginx` (reloads nginx after each renewal; NPM itself does not) |
+| Inactive cert cleanup | `/usr/local/sbin/npm-certbot-prune` moves certbot lineages of certs deleted in NPM to `/var/backups/letsencrypt-inactive-<ts>/`; runs on install/update and before each `certbot.timer` run (`--dry-run` lists them) |
 | Logs | `/data/logs/` |
 
 ### Backups (created automatically)
@@ -228,6 +229,7 @@ Verify thresholds:
 - **Certs served**: the cert nginx serves for each proxy host must match the file on disk, else FAIL (renewed but not reloaded)
 - **Host configs**: `*.conf.err` files (configs nginx rejected; the host is offline) → WARN
 - **HSTS / cert reload hook**: global `$hsts_header` left or reload hook missing → WARN (fixed by `--update`)
+- **Certbot inactive**: certs deleted in NPM still renewed by certbot → WARN
 - **Node.js**: below the latest security release of its major line → WARN
 
 ---
