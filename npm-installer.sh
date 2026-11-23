@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.3.6 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.3.7 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.3.7 — self-update uses git pull when run from a clone (no more
+#    replaced file, mode change or .bak files in the clone).
 #
 #  v1.3.6 — drop deprecated @types/country-flag-icons stub (pnpm WARN).
 #
@@ -93,7 +96,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.3.6"           # installer script version
+SCRIPT_VERSION="1.3.7"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -359,10 +362,54 @@ fi
 # ---------------------------------------------------------------------------
 # v1.1.27: self-update check -- offer a newer installer from main, then re-run it
 # ---------------------------------------------------------------------------
+# v1.3.7: in a git clone of npm-native on main, update with git pull (keeps the
+# clone clean) instead of replacing the file. Returns 0 to fall back to curl.
+_self_update_git() {
+    local self dir remote ans=""
+    self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)
+    dir=$(dirname "${self}")
+    local -a g=(git -C "${dir}" -c core.fileMode=false -c "safe.directory=${dir}")
+    command -v git &>/dev/null && [[ -f "${self}" ]] || return 0
+    "${g[@]}" rev-parse --is-inside-work-tree &>/dev/null || return 0
+    "${g[@]}" remote get-url origin 2>/dev/null | grep -q 'njordium/npm-native' || return 0
+    if [[ "$("${g[@]}" rev-parse --abbrev-ref HEAD 2>/dev/null)" != "main" ]]; then
+        warn "Installer clone ${dir} is not on main ${G_DASH} skipping the update check"
+        NPM_SELF_UPDATE=false; return 0
+    fi
+    if ! timeout 20 "${g[@]}" fetch -q origin main 2>/dev/null; then
+        NPM_SELF_UPDATE=false; return 0
+    fi
+    remote=$("${g[@]}" show origin/main:npm-installer.sh 2>/dev/null \
+        | grep -m1 -oP '^SCRIPT_VERSION="\K[0-9]+\.[0-9]+\.[0-9]+' || true)
+    NPM_SELF_UPDATE=false   # the git path decides; no curl fallback
+    if [[ -z "${remote}" ]] || ! _ver_lt "${SCRIPT_VERSION}" "${remote}"; then return 0; fi
+    warn "A newer installer is available: v${SCRIPT_VERSION} ${G_ARROW} v${remote} (git clone ${dir})"
+    if [[ -n "$("${g[@]}" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+        warn "Local changes in ${dir} ${G_DASH} not updating. Run: git -C ${dir} stash && git -C ${dir} pull"
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        warn "Non-interactive ${G_DASH} continuing with v${SCRIPT_VERSION}. Run: git -C ${dir} pull"
+        return 0
+    fi
+    read -rp "  Run git pull and restart the installer? [Y/n]: " ans || true
+    [[ "${ans}" =~ ^[Nn] ]] && return 0
+    if "${g[@]}" pull -q --ff-only origin main; then
+        # tracked 644: undo local chmod so a plain git pull works later
+        "${g[@]}" ls-files -s -- '*.sh' | awk '$1=="100644"{print $4}' \
+            | while read -r f; do chmod 644 "${dir}/${f}"; done
+        log "Installer updated to v${remote} (git pull in ${dir})"
+        _tmp_cleanup
+        trap - EXIT
+        exec bash "${self}" "$@"
+    fi
+    warn "git pull failed in ${dir} ${G_DASH} continuing with v${SCRIPT_VERSION}"
+}
 _self_update() {
     local url="https://raw.githubusercontent.com/njordium/npm-native/main/npm-installer.sh"
     local new remote self ans=""
     [[ "${NPM_SELF_UPDATE:-true}" == "false" ]] && return 0
+    _self_update_git "$@"
     new=$(mktemp /tmp/npm-installer-new.XXXXXX.sh) || return 0
     remote=""
     if curl -fsSL --max-time 10 -o "${new}" "${url}" 2>/dev/null && bash -n "${new}" 2>/dev/null; then
