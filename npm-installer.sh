@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.3.7 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.3.8 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.3.8 — --update keeps a locally changed logrotate "rotate N".
 #
 #  v1.3.7 — self-update uses git pull when run from a clone (no more
 #    replaced file, mode change or .bak files in the clone).
@@ -96,7 +98,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.3.7"           # installer script version
+SCRIPT_VERSION="1.3.8"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -3450,11 +3452,15 @@ _step6b_configure_nginx
 _step6c_logrotate() {
 # Configure logrotate for NPM
 # ---------------------------------------------------------------------------
-cat > /etc/logrotate.d/nginx-proxy-manager <<'LOGROTATE'
-/data/logs/*.log {
+# v1.3.8: keep a locally changed "rotate N" (days kept) across updates
+_LR_ROTATE=$(awk '$1=="rotate" && $2 ~ /^[0-9]+$/ {print $2; exit}' /etc/logrotate.d/nginx-proxy-manager 2>/dev/null || true)
+_LR_ROTATE="${_LR_ROTATE:-14}"
+[[ "${_LR_ROTATE}" == 14 ]] || info "logrotate: keeping rotate ${_LR_ROTATE} (days of logs kept)"
+cat > /etc/logrotate.d/nginx-proxy-manager <<LOGROTATE
+${NPM_DATA}/logs/*.log {
     daily
     missingok
-    rotate 14
+    rotate ${_LR_ROTATE}
     compress
     delaycompress
     notifempty
