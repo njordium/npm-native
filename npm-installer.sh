@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.3.8 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.3.9 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.3.9 — pnpm 12: deny agent skills from @tanstack/react-table, explicit
+#    store when /tmp is another fs, drop unused uuid override (WARNs);
+#    remove a stale /usr/local pnpm that shadowed the new one.
 #
 #  v1.3.8 — --update keeps a locally changed logrotate "rotate N".
 #
@@ -98,7 +102,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.3.8"           # installer script version
+SCRIPT_VERSION="1.3.9"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -2041,6 +2045,15 @@ if ! command -v node-gyp &>/dev/null; then
     vrun npm install -g node-gyp --quiet
 fi
 vrun npm install -g pnpm@latest --silent
+# v1.3.9: an old pnpm left in /usr/local (earlier npm prefix) shadowed the new one
+_npm_bin="$(npm prefix -g 2>/dev/null)/bin"
+if [[ -x "${_npm_bin}/pnpm" && "$(command -v pnpm)" != "${_npm_bin}/pnpm" ]]; then
+    warn "Stale pnpm $(pnpm --version 2>/dev/null) at $(command -v pnpm) ${G_DASH} using ${_npm_bin}/pnpm"
+    if [[ "${_npm_bin}" != /usr/local/bin && -d /usr/local/lib/node_modules/pnpm ]]; then
+        vrun npm rm -g --prefix /usr/local pnpm --silent || true
+    fi
+    export PATH="${_npm_bin}:${PATH}"; hash -r
+fi
 info "pnpm $(pnpm --version) ready."
 
 # ── Patch react-intl → v10 ───────────────────────────────────────────────────
@@ -2115,7 +2128,19 @@ onlyBuiltDependencies:
   - unrs-resolver
   - "@biomejs/biome"
   - sass
+
+# v1.3.9: pnpm 12 asks to install agent skills shipped in packages; deny
+permissions:
+  "@tanstack/react-table":
+    skills: false
 YAML_FE
+# v1.3.9: build tree on another fs than the pnpm store (tmpfs /tmp) -> pnpm
+# WARNs and falls back; name the store (removed after the run)
+_pn_home="${XDG_DATA_HOME:-${HOME}/.local/share}/pnpm"
+[[ -d "${_pn_home}" ]] || _pn_home="${HOME}"
+if [[ "$(stat -c %d "${NPM_TMP}" 2>/dev/null)" != "$(stat -c %d "${_pn_home}" 2>/dev/null)" ]]; then
+    printf '\nstoreDir: /tmp/.pnpm-store\n' >> "${NPM_TMP}/frontend/pnpm-workspace.yaml"
+fi
 info "wrote frontend/pnpm-workspace.yaml (allowBuilds for pnpm v11+, onlyBuiltDependencies for v10)"
 
 # ---------------------------------------------------------------------------
@@ -2650,7 +2675,7 @@ PKGJSON="${NPM_HOME}/backend/package.json"
 #   knex      3.1.x -> ^3.2.0 (latest bugfix release)
 #
 # Override pins for deprecated transitive deps live in pnpm-workspace.yaml below:
-#   glob/rimraf/tar/uuid (fixable);  prebuild-install/inflight/npmlog (unfixable)
+#   glob/rimraf/tar (fixable);  prebuild-install/inflight/npmlog (unfixable)
 jq '.dependencies.sqlite3 = "^6.0.0" |
     .dependencies.knex    = "^3.2.0"' \
     "${PKGJSON}" > "${PKGJSON}.tmp" && mv "${PKGJSON}.tmp" "${PKGJSON}"
@@ -2688,12 +2713,10 @@ onlyBuiltDependencies:
 #   glob v7/v10  -> v11 (security-deprecated by upstream maintainer)
 #   rimraf v3/v4 -> v6  (deprecated)
 #   tar v6       -> v7  (deprecated; sqlite3@6 drops the chain naturally)
-#   uuid v3/v8   -> v10 (deprecated)
 overrides:
   glob: ^11.0.0
   rimraf: ^6.0.0
   tar: ^7.0.0
-  uuid: ^10.0.0
 
 # v1.1.16: suppress noise for transitively-pulled deprecated packages with
 # no working replacement (they are deep inside the bcrypt / sqlite3 /
