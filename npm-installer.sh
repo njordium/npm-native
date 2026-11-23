@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.3.4 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.3.5 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.3.5 — NPM 2.17: proxy-variables.conf ($forward_host), backend peer
+#    secret for the login rate limit, HSTS patch only on old templates,
+#    $hsts_header kept (#6059). nginx/certbot upgraded on --update; verify
+#    warns on nginx below stable (nginx2root) and certbot behind PyPI.
 #
 #  v1.3.4 — certs deleted in NPM are moved out of certbot (npm-certbot-prune,
 #    also before each certbot.timer run), so certbot stops renewing them.
@@ -86,7 +91,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.3.4"           # installer script version
+SCRIPT_VERSION="1.3.5"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -98,6 +103,9 @@ NPM_TMP="/tmp/npm-build"
 NPM_SERVICE="nginx-proxy-manager"
 ADMIN_PORT=81
 LE_RELOAD_HOOK="/etc/letsencrypt/renewal-hooks/deploy/npm-reload-nginx"
+# v1.3.5: secret the admin nginx sends with X-NPM-Peer-Addr (NPM 2.17 rate limit)
+PEER_SECRET_ENV="/etc/nginx/npm-peer-secret.env"
+PEER_SECRET_CONF="/etc/nginx/npm-peer-secret.conf"
 LE_PRUNE="/usr/local/sbin/npm-certbot-prune"
 # v1.3.0: nginx source on Debian/Ubuntu. auto = nginx.org on fresh Debian installs;
 # an existing distro nginx is switched after a prompt (kept when non-interactive).
@@ -302,10 +310,15 @@ _svc_enable()  { if _is_alpine; then rc-update add "$1" default &>/dev/null; els
 _svc()         { if _is_alpine; then rc-service "$2" "$1" </dev/null &>/dev/null; else systemctl "$1" "$2" </dev/null &>/dev/null; fi; }
 _svc_hint()    { if _is_alpine; then echo "rc-service $2 $1"; else echo "systemctl $1 $2"; fi; }
 _log_hint()    { if _is_alpine; then echo "tail -n 40 /var/log/${NPM_SERVICE}.log"; else echo "journalctl -u ${NPM_SERVICE} -n 40 --no-pager"; fi; }
-_pkg_install() { if _is_alpine; then vrun apk add --no-cache "$@"; else vrun apt-get install -y --no-install-recommends "$@"; fi; }
+# v1.3.5: apk -u upgrades listed packages, like apt-get install does
+_pkg_install() { if _is_alpine; then vrun apk add --no-cache -u "$@"; else vrun apt-get install -y --no-install-recommends "$@"; fi; }
 # _ver_lt a b: true when version a < b
 _ver_lt()      { [[ "$1" != "$2" && "$(printf '%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]; }
 _host_ip()     { ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}'; }
+_nginx_stable_ver() {
+    curl -fsSL --max-time 10 https://nginx.org/en/download.html 2>/dev/null \
+        | grep -oP 'Stable version.*?nginx-\K[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+}
 # v1.3.0: true when the installed nginx package comes from nginx.org
 _nginx_is_org() { dpkg-query -W -f='${Maintainer}' nginx 2>/dev/null | grep -qi 'nginx packaging'; }
 # v1.3.2: dirs the nginx workers write to (compiled-in temp paths + ours)
@@ -785,6 +798,24 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
             _nginx_is_org && _NGINX_V+=", nginx.org" || _NGINX_V+=", ${_OS_ID:-os} package"
         fi
         _pok  "nginx                active  (${_NGINX_V})"
+        # v1.3.5: nginx security fixes (e.g. nginx2root, fixed in 1.30.7/1.31.9)
+        _NGINX_RUN=$(nginx -v 2>&1 | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1 || true)
+        _NGINX_UPG=""
+        if _is_alpine; then
+            _NGINX_UPG=$(apk list -u nginx 2>/dev/null | grep -oP '^nginx-\K[0-9.]+' | head -1 || true)
+        else
+            _NGINX_UPG=$(apt-cache policy nginx 2>/dev/null | awk '/Installed:/{i=$2} /Candidate:/{c=$2} END{if(i!=c && c!="(none)") print c}' || true)
+        fi
+        # stable is only compared on the same minor line (distro backports differ)
+        _NGINX_ST=$(_nginx_stable_ver)
+        [[ "${_NGINX_ST%.*}" == "${_NGINX_RUN%.*}" ]] || _NGINX_ST=""
+        if [[ -n "${_NGINX_UPG}" ]]; then
+            _pwarn "nginx security       ${_NGINX_RUN} running, package ${_NGINX_UPG} available ${G_DASH} run --update"
+        elif [[ -n "${_NGINX_ST}" && -n "${_NGINX_RUN}" ]] && _ver_lt "${_NGINX_RUN}" "${_NGINX_ST}"; then
+            _pwarn "nginx security       ${_NGINX_RUN} is below stable ${_NGINX_ST} ${G_DASH} run --update (or wait for the package)"
+        else
+            _pok  "nginx security       ${_NGINX_RUN:-?} is the newest available package"
+        fi
     else
         _pfail "nginx                NOT running"
     fi
@@ -924,6 +955,19 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
     if [[ -f "/opt/certbot/bin/activate" ]]; then
         _CB_VER=$(/opt/certbot/bin/certbot --version 2>&1 | grep -oP '[\d.]+' | head -1 || true)
         _pok  "certbot venv         /opt/certbot (v${_CB_VER}) ${G_DASH} DNS plugins will install correctly"
+        # v1.3.5: certbot behind PyPI, or broken plugin deps after an upgrade
+        _CB_PYPI=$(curl -fsS --max-time 10 https://pypi.org/pypi/certbot/json 2>/dev/null \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['info']['version'])" 2>/dev/null || true)
+        if [[ -n "${_CB_PYPI}" && -n "${_CB_VER}" ]] && _ver_lt "${_CB_VER}" "${_CB_PYPI}"; then
+            _pwarn "certbot version      v${_CB_VER}, PyPI has v${_CB_PYPI} ${G_DASH} run --update"
+        elif [[ -n "${_CB_PYPI}" ]]; then
+            _pok  "certbot version      v${_CB_VER} is the latest release"
+        fi
+        if _CB_CHK=$(/opt/certbot/bin/pip check 2>&1); then
+            _pok  "certbot packages     pip check OK ($(/opt/certbot/bin/pip list 2>/dev/null | { grep -c '^certbot-dns' || true; }) DNS plugin(s))"
+        else
+            _pwarn "certbot packages     pip check: $(echo "${_CB_CHK}" | head -2 | tr '\n' ' ')"
+        fi
     else
         _pfail "certbot venv         /opt/certbot MISSING ${G_DASH} DNS challenge cert requests will fail"
         echo  "       ${G_ARROW} run: python3 -m venv /opt/certbot && /opt/certbot/bin/pip install certbot"
@@ -931,7 +975,9 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
 
     # Check Docker rootfs include files — required for proxy host config generation
     _MISS=0
-    for _INC in proxy.conf block-exploits.conf force-ssl.conf ssl-ciphers.conf; do
+    _INCS=(proxy.conf block-exploits.conf force-ssl.conf ssl-ciphers.conf)
+    if grep -qs 'proxy-variables.conf' /etc/nginx/nginx.conf; then _INCS+=(proxy-variables.conf); fi
+    for _INC in "${_INCS[@]}"; do
         [[ ! -f "/etc/nginx/conf.d/include/${_INC}" ]] && {
             _pfail "nginx include /etc/nginx/conf.d/include/${_INC} MISSING ${G_DASH} proxy hosts will not write nginx configs"
             _MISS=$(( _MISS + 1 ))
@@ -997,13 +1043,20 @@ if [[ "${INSTALL_MODE}" == "verify" ]]; then
         echo  "       ${G_ARROW} fix the host in the UI (often Advanced config) and save it again"
     fi
     # shellcheck disable=SC2016  # literal $ in the regex
-    _HSTS_OLD=$(grep -l 'map \$scheme \$hsts_header' "${NPM_DATA}"/nginx/*/*.conf "${NPM_HOME}/backend/templates/_hsts_map.conf" 2>/dev/null | wc -l || true)
+    _HSTS_OLD=$(grep -l 'map \$scheme \$hsts_header ' "${NPM_DATA}"/nginx/*/*.conf "${NPM_HOME}/backend/templates/_hsts_map.conf" 2>/dev/null | wc -l || true)
     if ! grep -q 'Strict-Transport-Security' "${NPM_HOME}/backend/templates/_hsts.conf" 2>/dev/null; then
         _pfail "HSTS                 template _hsts.conf has no Strict-Transport-Security ${G_DASH} new hosts lose HSTS (run --update)"
     elif [[ ${_HSTS_OLD} -eq 0 ]]; then
         _pok  "HSTS                 Sub-domains set per host"
     else
         _pwarn "HSTS                 global \$hsts_header in ${_HSTS_OLD} file(s) ${G_DASH} one host's Sub-domains setting applies to all (run --update)"
+    fi
+    # v1.3.5: NPM 2.17 login rate limit keys on X-NPM-Peer-Addr, trusted only with the secret
+    if [[ -s "${PEER_SECRET_ENV}" && -s "${PEER_SECRET_CONF}" ]] && grep -q 'X-NPM-Peer-Addr' /etc/nginx/nginx.conf 2>/dev/null \
+        && [[ "$(stat -c %a "${PEER_SECRET_ENV}")" == 600 ]]; then
+        _pok  "peer secret          admin nginx ${G_ARROW} backend (login rate limit per client)"
+    else
+        _pwarn "peer secret          missing ${G_DASH} login rate limit is shared by all clients (run --update)"
     fi
     if [[ -x "${LE_RELOAD_HOOK}" ]]; then
         _pok  "cert reload hook     nginx reloads after renewals"
@@ -1554,10 +1607,6 @@ _nginx_org_pkg_ver() {
         | gzip -dc 2>/dev/null \
         | awk '/^Package: nginx$/{p=1} p&&/^Version:/{sub(/-.*/,"",$2); print $2; p=0}' | sort -V | tail -1 || true
 }
-_nginx_stable_ver() {
-    curl -fsSL --max-time 10 https://nginx.org/en/download.html 2>/dev/null \
-        | grep -oP 'Stable version.*?nginx-\K[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
-}
 # true when nginx.org has the current stable for this release (or stable is unknown)
 _nginx_org_current() {
     _NGINX_ORG_VER=$(_nginx_org_pkg_ver)
@@ -1738,7 +1787,10 @@ _step1b_certbot_venv() {
 step "Creating certbot virtualenv at /opt/certbot"
 python3 -m venv /opt/certbot
 vrun /opt/certbot/bin/pip install --quiet --upgrade pip
-vrun /opt/certbot/bin/pip install --quiet certbot
+# v1.3.5: --upgrade, otherwise certbot stays at the first-installed version.
+# NPM reinstalls DNS plugins at start pinned to the new CERTBOT_VERSION.
+vrun /opt/certbot/bin/pip install --quiet --upgrade certbot
+_CB_CHK=$(/opt/certbot/bin/pip check 2>&1) || warn "certbot venv pip check: $(echo "${_CB_CHK}" | head -3 | tr '\n' ' ')"
 log "certbot virtualenv ready: $(/opt/certbot/bin/certbot --version 2>&1)"
 
 # v1.1.24 (issue #8): capture the certbot version for the systemd unit.
@@ -2497,8 +2549,9 @@ tpl, data = sys.argv[1:3]
 val = '"max-age=63072000;{% if hsts_subdomains == 1 or hsts_subdomains == true -%} includeSubDomains;{% endif %} preload"'
 p = os.path.join(tpl, "_hsts.conf")
 src = open(p).read() if os.path.isfile(p) else ""
-if "$hsts_header" in src:
-    open(p, "w").write(src.replace("$hsts_header", val))
+# v1.3.5: NPM 2.17 has per-host $hsts_header_plain/_subdomains; leave it alone
+if re.search(r"\$hsts_header\b", src):
+    open(p, "w").write(re.sub(r"\$hsts_header\b", lambda _: val, src))
     open(os.path.join(tpl, "_hsts_map.conf"), "w").write("")
     print("  HSTS templates patched")
 n = 0
@@ -3018,26 +3071,6 @@ http {
     access_log __NPM_DATA__/logs/fallback_access.log standard;
     error_log  __NPM_DATA__/logs/fallback_error.log  warn;
 
-    # ── Variables required by NPM's proxy_host.conf template ─────────────────
-    # $x_forwarded_proto and $x_forwarded_scheme are NOT built-in nginx variables.
-    # They are defined in the Docker nginx.conf via map blocks. Without these,
-    # nginx -t fails with "unknown variable" on every proxy host config, causing
-    # NPM to silently roll back the config write. proxy_host files never appear.
-    map $http_x_forwarded_proto $x_forwarded_proto {
-        http    http;
-        https   https;
-        default $scheme;
-    }
-    map $http_x_forwarded_scheme $x_forwarded_scheme {
-        http    http;
-        https   https;
-        default $scheme;
-    }
-    # Default upstream scheme (used by NPM template)
-    map $host $forward_scheme {
-        default http;
-    }
-
     # ── Real IP — trust local subnets and CDN ranges ───────────────────────────
     set_real_ip_from 10.0.0.0/8;
     set_real_ip_from 172.16.0.0/12;
@@ -3045,6 +3078,10 @@ http {
     include /etc/nginx/conf.d/include/ip_ranges[.]conf;
     real_ip_header    X-Real-IP;
     real_ip_recursive on;
+
+    # $forward_host, $forward_scheme, $x_forwarded_* (v1.3.5: from NPM's
+    # proxy-variables.conf; the installer writes it for NPM < 2.17.1)
+    include /etc/nginx/conf.d/include/proxy-variables.conf;
 
     # ── Resolvers ─────────────────────────────────────────────────────────────
     include /etc/nginx/conf.d/include/resolvers.conf;
@@ -3088,6 +3125,9 @@ http {
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
+            # v1.3.5: TCP peer for the backend login rate limit (NPM 2.17+)
+            proxy_set_header   X-NPM-Peer-Addr   $realip_remote_addr;
+            include            __PEER_SECRET_CONF__;
             proxy_read_timeout 90s;
         }
 
@@ -3118,7 +3158,15 @@ NGINX_CONF
 
 # Replace placeholders with actual paths (keeps heredoc single-quoted to avoid
 # escaping dozens of nginx $ variables)
-sed -i "s|__NPM_HOME__|${NPM_HOME}|g; s|__NPM_DATA__|${NPM_DATA}|g; s|__NGINX_USER__|${NGINX_USER}|; s|__NGINX_PID__|${NGINX_PID}|; s|__NGINX_MODULES__|${NGINX_MODULES_GLOB}|" /etc/nginx/nginx.conf
+sed -i "s|__NPM_HOME__|${NPM_HOME}|g; s|__NPM_DATA__|${NPM_DATA}|g; s|__NGINX_USER__|${NGINX_USER}|; s|__NGINX_PID__|${NGINX_PID}|; s|__NGINX_MODULES__|${NGINX_MODULES_GLOB}|; s|__PEER_SECRET_CONF__|${PEER_SECRET_CONF}|" /etc/nginx/nginx.conf
+
+# v1.3.5: new peer secret per install/update, root-only (NPM 2.17 rate limit)
+_PEER_SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+[[ ${#_PEER_SECRET} -eq 64 ]] || die "Failed to generate the backend peer secret"
+( umask 077
+  printf 'proxy_set_header X-NPM-Peer-Secret "%s";\n' "${_PEER_SECRET}" > "${PEER_SECRET_CONF}"
+  printf 'NPM_PEER_SECRET=%s\n' "${_PEER_SECRET}" > "${PEER_SECRET_ENV}" )
+unset _PEER_SECRET
 
 # v1.1.26: warn about dropped nginx.conf lines (not carried over)
 if [[ -s "${_OLD_NGINX_CONF}" ]]; then
@@ -3133,6 +3181,9 @@ def lines(path):
             out.append(l)
     return out
 new = set(lines(sys.argv[2]))
+# v1.3.5: maps moved to conf.d/include/proxy-variables.conf
+new |= {"map $http_x_forwarded_proto $x_forwarded_proto {", "map $http_x_forwarded_scheme $x_forwarded_scheme {",
+        "map $host $forward_scheme {", "http http;", "https https;", "default $scheme;", "default http;"}
 for l in lines(sys.argv[1]):
     if l not in new:
         print("      " + l)
@@ -3176,6 +3227,35 @@ if [[ -d "${NPM_TMP}/docker/rootfs/etc/nginx/conf.d/include" ]]; then
     log "Copied nginx include files (proxy.conf, block-exploits.conf, etc.)"
 else
     warn "docker/rootfs/etc/nginx/conf.d/include not found ${G_DASH} proxy host configs may fail"
+fi
+# v1.3.5: NPM < 2.17.1 has the maps in its own nginx.conf, not in an include
+if [[ ! -f /etc/nginx/conf.d/include/proxy-variables.conf ]]; then
+    cat > /etc/nginx/conf.d/include/proxy-variables.conf <<'PROXYVARS'
+# Written by npm-installer.sh (NPM < 2.17.1 has no proxy-variables.conf)
+map $host $forward_scheme {
+	default http;
+}
+map $http_x_forwarded_proto $x_forwarded_proto {
+	"http" "http";
+	"https" "https";
+	default $scheme;
+}
+map $http_x_forwarded_scheme $x_forwarded_scheme {
+	"http" "http";
+	"https" "https";
+	default $scheme;
+}
+PROXYVARS
+fi
+# v1.3.5: NPM 2.17 dropped $hsts_header; keep it for Advanced configs using it (upstream #6059)
+if grep -qs 'hsts_header_plain' "${NPM_HOME}/backend/templates/_hsts_map.conf"; then
+    cat >> /etc/nginx/conf.d/include/proxy-variables.conf <<'HSTSCOMPAT'
+
+# Written by npm-installer.sh: $hsts_header from NPM < 2.17 (upstream #6059)
+map $scheme $hsts_header {
+	https "max-age=63072000; preload";
+}
+HSTSCOMPAT
 fi
 
 # ── Create custom snippet stubs for NPM template includes ─────────────────────
@@ -3374,6 +3454,8 @@ export NODE_ENV=production
 export SUPPRESS_NO_CONFIG_WARNING=1
 export NGINX_BINARY=/usr/sbin/nginx
 ${_CERTBOT_EXPORT}
+# v1.3.5: NPM_PEER_SECRET for the login rate limit (NPM 2.17+)
+[ -r ${PEER_SECRET_ENV} ] && export "\$(cat ${PEER_SECRET_ENV})"
 
 depend() {
     need net nginx
@@ -3437,6 +3519,8 @@ Environment=SUPPRESS_NO_CONFIG_WARNING=1
 Environment=LD_PRELOAD=
 # Tell the backend where nginx lives so it can reload configs
 Environment=NGINX_BINARY=/usr/sbin/nginx
+# v1.3.5: NPM_PEER_SECRET for the login rate limit (NPM 2.17+)
+EnvironmentFile=-${PEER_SECRET_ENV}
 # v1.1.24 (issue #8): NPM substitutes this into the pip requirement for
 # every certbot DNS plugin it installs. Unset -> "acme==undefined" -> pip
 # rejects it. Empty -> "acme==" -> pip also rejects it. The line is built
