@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Nginx Proxy Manager — Native Linux Installer v1.3.5 (Debian / Ubuntu / Alpine)
+#  Nginx Proxy Manager — Native Linux Installer v1.3.6 (Debian / Ubuntu / Alpine)
 #  No Docker  |  SQLite  |  Systemd / OpenRC  |  Team Njordium
 #  Script Authors: Kim Haverblad & Tommy Jansson
+#
+#  v1.3.6 — drop deprecated @types/country-flag-icons stub (pnpm WARN).
 #
 #  v1.3.5 — NPM 2.17: proxy-variables.conf ($forward_host), backend peer
 #    secret for the login rate limit, HSTS patch only on old templates,
@@ -91,7 +93,7 @@ fi
 # ---------------------------------------------------------------------------
 # NPM_VERSION: auto-resolved to latest GitHub release unless overridden.
 # The resolved version is shown in the splash and confirmed before install.
-SCRIPT_VERSION="1.3.5"           # installer script version
+SCRIPT_VERSION="1.3.6"           # installer script version
 NPM_VERSION="${NPM_VERSION:-}"   # empty = auto-detect latest
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_HOME="${NPM_HOME:-/opt/nginx-proxy-manager}"
@@ -2021,6 +2023,12 @@ if [[ -n "${_RI_MAJOR}" && "${_RI_MAJOR}" -lt 10 ]]; then
     info "react-intl patched: ${_RI_SPEC} ${G_ARROW} ~10.1.0 (v9 broken/deprecated; v10 API-compatible)"
 elif [[ -n "${_RI_SPEC}" ]]; then
     info "react-intl: upstream ${_RI_SPEC} kept (already v10+)"
+fi
+# v1.3.6: deprecated stub; country-flag-icons ships its own types
+if jq -e '.devDependencies["@types/country-flag-icons"]' "${_FRONTEND_PKG}" &>/dev/null; then
+    jq 'del(.devDependencies["@types/country-flag-icons"])' "${_FRONTEND_PKG}" \
+        > "${_FRONTEND_PKG}.tmp" && mv "${_FRONTEND_PKG}.tmp" "${_FRONTEND_PKG}"
+    info "@types/country-flag-icons removed (deprecated stub)"
 fi
 
 # ---------------------------------------------------------------------------
